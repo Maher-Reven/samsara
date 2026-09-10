@@ -7,4 +7,7 @@
 
 pub mod canon;
 pub mod cas;
+pub mod event;
+pub mod fault;
 pub mod hash;
+pub mod trace;
