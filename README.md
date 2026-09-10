@@ -65,7 +65,19 @@ cargo run --bin samsara -- show traces/counterfactual.samsara.jsonl
 ```
 
 The [browser timeline](https://maher-reven.github.io/samsara/) runs the same
-engine. To build it locally:
+engine. Drop a bundle onto it to inspect one of your own recordings:
+
+```bash
+samsara bundle run.samsara.jsonl --out bundle.json
+```
+
+A loaded trace can be inspected but not forked, and that is a real
+distinction rather than a missing feature: forking means re-running the agent
+under different conditions, and a bundle contains the recording, not the
+program that produced it. Counterfactuals live in `samsara replay`, where the
+agent is present.
+
+To build the page locally:
 
 ```bash
 make web && python3 -m http.server -d web 8000

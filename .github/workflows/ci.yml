@@ -107,6 +107,11 @@ jobs:
       # Rust and the wasm still loads perfectly -- the page just renders
       # undefined in every row. This catches that in CI rather than in front
       # of a visitor.
+      # The contract tests drive the real CLI to produce a bundle, so the
+      # binary has to exist.
+      - name: Build the CLI
+        run: cargo build --bin samsara
+
       - name: Page/engine contract
         run: |
           wasm-bindgen --target nodejs --no-typescript --out-dir web/pkg-node \

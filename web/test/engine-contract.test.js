@@ -164,3 +164,82 @@ test("the fixed agent survives what breaks the naive one", () => {
   );
   assert.equal(run.violations.length, 0, "the toggle in the page must show a real difference");
 });
+
+// ---------------------------------------------------------------------------
+// Loading a bundle
+// ---------------------------------------------------------------------------
+
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const { inspect_bundle } = require("../pkg-node/samsara_wasm.js");
+
+/**
+ * Produce a bundle with the real CLI.
+ *
+ * `samsara bundle` promised for several commits that its output "opens in
+ * the web timeline", and nothing could open it. This test exists so that
+ * claim stays true rather than being taken on trust.
+ */
+function realBundle() {
+  const dir = mkdtempSync(join(tmpdir(), "samsara-bundle-"));
+  const bin = join(process.cwd(), "target", "debug", "samsara");
+  execFileSync(bin, ["emit", "--out", dir], { stdio: "pipe" });
+  const out = join(dir, "bundle.json");
+  execFileSync(bin, ["bundle", join(dir, "counterfactual.samsara.jsonl"), "--out", out], {
+    stdio: "pipe",
+  });
+  const text = readFileSync(out, "utf8");
+  rmSync(dir, { recursive: true, force: true });
+  return text;
+}
+
+test("a bundle written by the CLI opens in the viewer", () => {
+  const run = JSON.parse(inspect_bundle(realBundle()));
+
+  assert.equal(run.error, undefined, `bundle rejected: ${run.error}`);
+  assertRunShape(run, "bundle");
+  assert.equal(run.readonly, true, "a loaded trace cannot be forked");
+  assert.equal(typeof run.label, "string");
+
+  // The demo's counterfactual contains the duplicate delete, so the viewer
+  // must surface it — the invariants run on loaded traces too.
+  assert.ok(run.violations.length >= 1, "the viewer checks invariants");
+  assert.match(run.violations[0].invariant, /duplicate/);
+
+  // Payloads must resolve out of the bundle's embedded object store, or
+  // every row renders blank.
+  const tool = run.events.find((e) => e.name === "delete_file");
+  assert.ok(tool, "the trace has the delete");
+  assert.ok(tool.request?.body?.path, "request payload resolved from the bundle");
+  assert.ok(tool.outcome, "outcome payload resolved from the bundle");
+});
+
+test("a faulted event in a bundle keeps its shadow", () => {
+  const run = JSON.parse(inspect_bundle(realBundle()));
+  const faulted = run.events.filter((e) => e.fault);
+  assert.equal(faulted.length, 1);
+  assert.ok(faulted[0].shadow, "the viewer can show what the fault suppressed");
+});
+
+test("junk is refused with a message, not a panic", () => {
+  for (const junk of ["", "not json", "{}", '{"trace": 42}', '{"trace": {"header": {}}}']) {
+    const run = JSON.parse(inspect_bundle(junk));
+    assert.equal(typeof run.error, "string", `no error for ${JSON.stringify(junk)}`);
+  }
+});
+
+test("payload digests are recomputed, not trusted", () => {
+  // A hand-edited bundle must not be able to make an event point at content
+  // it does not hash to.
+  const bundle = JSON.parse(realBundle());
+  const [first] = Object.keys(bundle.objects);
+  bundle.objects[first] = '{"status":"ok","value":"tampered"}';
+
+  const run = JSON.parse(inspect_bundle(JSON.stringify(bundle)));
+  assert.equal(run.error, undefined);
+  const tampered = JSON.stringify(run.events).includes("tampered");
+  assert.equal(tampered, false, "swapped content must not be served under the old digest");
+});
