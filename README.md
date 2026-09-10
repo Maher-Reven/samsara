@@ -232,10 +232,12 @@ position stays well defined after the fork, and says what you actually mean:
 ```
 crates/samsara-core    engine: trace, CAS, canonicalisation, replay, faults,
                        shrinking, invariants  (59 tests)
-crates/samsara-cli     the `samsara` binary
+crates/samsara-cli     the `samsara` binary, and end-to-end tests that drive
+                       it against a stub provider  (6 tests)
 crates/samsara-wasm    WebAssembly bindings for the timeline
-shim/typescript        the tool-side shim
-web/                   the browser timeline
+shim/typescript        the tool-side shim  (9 tests)
+web/                   the browser timeline, and a contract test pinning
+                       every JSON field the page reads  (7 tests)
 ```
 
 ## Prior art
