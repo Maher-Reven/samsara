@@ -247,18 +247,23 @@ impl FaultSchedule {
 /// agent retry, and retry paths are the least-tested code in any agent.
 fn random_fault(rng: &mut ChaCha8Rng) -> Fault {
     match rng.gen_range(0..100) {
-        0..=39 => Fault::Timeout,
-        40..=59 => Fault::Error {
+        0..=34 => Fault::Timeout,
+        35..=52 => Fault::Error {
             code: ["500", "503", "429"][rng.gen_range(0..3)].to_string(),
         },
-        60..=74 => Fault::Truncate {
+        53..=64 => Fault::Truncate {
             keep: rng.gen_range(0..64),
         },
-        75..=84 => Fault::Duplicate,
-        85..=94 => Fault::Malformed,
-        _ => Fault::Delay {
+        65..=72 => Fault::Duplicate,
+        73..=82 => Fault::Malformed,
+        83..=89 => Fault::Delay {
             ms: rng.gen_range(100..30_000),
         },
+        // Inert unless it lands where a concurrent batch begins, and that is
+        // deliberate: the generator does not know the trace's shape, so an
+        // occasional wasted replay is the price of seed search being able to
+        // find an ordering bug at all. The shrinker removes the inert ones.
+        _ => Fault::Reorder { seed: rng.gen() },
     }
 }
 
@@ -300,6 +305,38 @@ mod tests {
     fn empty_inputs_yield_empty_schedules() {
         assert!(FaultSchedule::generate(1, &[], 5).is_empty());
         assert!(FaultSchedule::generate(1, &[1, 2, 3], 0).is_empty());
+    }
+
+    #[test]
+    fn the_generator_can_produce_every_fault_kind() {
+        // A fault the generator never emits is a fault seed search can never
+        // find. `Reorder` was exactly that for one commit.
+        let eligible: Vec<u64> = (0..8).collect();
+        let mut kinds: std::collections::HashSet<&'static str> = Default::default();
+        for seed in 0..400u64 {
+            for point in FaultSchedule::generate(seed, &eligible, 4).points {
+                kinds.insert(match point.fault {
+                    Fault::Timeout => "timeout",
+                    Fault::Error { .. } => "error",
+                    Fault::Truncate { .. } => "truncate",
+                    Fault::Duplicate => "duplicate",
+                    Fault::Malformed => "malformed",
+                    Fault::Delay { .. } => "delay",
+                    Fault::Reorder { .. } => "reorder",
+                });
+            }
+        }
+        for kind in [
+            "timeout",
+            "error",
+            "truncate",
+            "duplicate",
+            "malformed",
+            "delay",
+            "reorder",
+        ] {
+            assert!(kinds.contains(kind), "generator never produced {kind}");
+        }
     }
 
     #[test]
