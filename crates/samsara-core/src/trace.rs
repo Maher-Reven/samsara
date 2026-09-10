@@ -226,6 +226,7 @@ mod tests {
             fault: None,
             shadow: None,
             logical_time: seq,
+            batch: None,
         }
     }
 

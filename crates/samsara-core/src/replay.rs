@@ -69,6 +69,33 @@ pub trait Effects {
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0)
     }
+
+    /// Perform several effects that the agent issued **concurrently**.
+    ///
+    /// Returns `(original index, outcome)` pairs **in completion order**,
+    /// which is the whole point of the method existing.
+    ///
+    /// # Why this does not need threads
+    ///
+    /// Testing order-dependence does not require concurrency, it requires
+    /// *control over order* — and real concurrency gives you the opposite of
+    /// that. So Samsara runs the calls one at a time and chooses the order,
+    /// which is what a deterministic simulator does and why the result
+    /// reproduces from a seed.
+    ///
+    /// The model is faithful as long as the agent's observable behaviour
+    /// depends on the order results arrive in, which is exactly the property
+    /// under test. An agent that collects results and sorts them by index
+    /// (`Promise.all`) is unaffected by any permutation, and correctly so. An
+    /// agent that folds each result into shared state as it lands — how most
+    /// are written — is not.
+    fn perform_batch(&mut self, requests: Vec<EffectRequest>) -> Vec<(usize, Outcome)> {
+        requests
+            .into_iter()
+            .enumerate()
+            .map(|(i, request)| (i, self.perform(request)))
+            .collect()
+    }
 }
 
 /// A source of real effects: the live model API, the real tools, the real
@@ -89,6 +116,9 @@ pub struct Recorder<'a, C: Cas, B: Backend> {
     canon: Canonicalizer,
     events: Vec<Event>,
     logical_time: u64,
+    /// Set while a concurrent batch is being performed.
+    current_batch: Option<u64>,
+    next_batch: u64,
 }
 
 impl<C: Cas, B: Backend> std::fmt::Debug for Recorder<'_, C, B> {
@@ -108,6 +138,8 @@ impl<'a, C: Cas, B: Backend> Recorder<'a, C, B> {
             canon,
             events: Vec::new(),
             logical_time: 0,
+            current_batch: None,
+            next_batch: 0,
         }
     }
 
@@ -155,10 +187,30 @@ impl<C: Cas, B: Backend> Effects for Recorder<'_, C, B> {
             fault: None,
             shadow: None,
             logical_time: self.logical_time,
+            batch: self.current_batch,
         });
         self.logical_time += 1;
 
         outcome
+    }
+
+    fn perform_batch(&mut self, requests: Vec<EffectRequest>) -> Vec<(usize, Outcome)> {
+        // Recording fixes a canonical completion order: index order. The
+        // recorded order is a fact about one run, and treating it as the
+        // baseline is what lets replay detect that a permutation changed
+        // something.
+        let batch = self.next_batch;
+        self.next_batch += 1;
+        self.current_batch = Some(batch);
+
+        let results = requests
+            .into_iter()
+            .enumerate()
+            .map(|(i, request)| (i, self.perform(request)))
+            .collect();
+
+        self.current_batch = None;
+        results
     }
 }
 
@@ -410,6 +462,10 @@ pub struct Replayer<'a, C: Cas> {
     branch: Vec<Event>,
     logical_time: u64,
 
+    /// Set while a concurrent batch is being replayed.
+    current_batch: Option<u64>,
+    next_batch: u64,
+
     /// Clock and randomness once we are off-script.
     ///
     /// Post-fork these must not come from the oracle. Time has to keep
@@ -466,6 +522,8 @@ impl<'a, C: Cas> Replayer<'a, C> {
             oracle: ResponseOracle::build(trace, &*cas)?,
             free_clock_ms: last_clock,
             free_rng: ChaCha8Rng::from_seed(seed_bytes),
+            current_batch: None,
+            next_batch: 0,
             trace,
             cas,
             mode,
@@ -588,6 +646,7 @@ impl<'a, C: Cas> Replayer<'a, C> {
             fault,
             shadow: shadow_digest,
             logical_time: self.logical_time,
+            batch: self.current_batch,
         });
         self.logical_time += 1;
     }
@@ -694,6 +753,39 @@ impl<C: Cas> Replayer<'_, C> {
 }
 
 impl<C: Cas> Effects for Replayer<'_, C> {
+    fn perform_batch(&mut self, requests: Vec<EffectRequest>) -> Vec<(usize, Outcome)> {
+        let batch = self.next_batch;
+        self.next_batch += 1;
+        self.current_batch = Some(batch);
+
+        // A scheduling fault sitting at the position where the batch begins
+        // decides the completion order. Absent one, index order — the same
+        // order recording used, so an unfaulted replay still matches the
+        // recording positionally and stays in lockstep.
+        let position = self.branch.len() as u64;
+        let order = match &self.mode {
+            Mode::Counterfactual { schedule } => schedule
+                .at(position)
+                .filter(|f| f.is_scheduling())
+                .and_then(|f| f.permutation(requests.len())),
+            Mode::Strict => None,
+        }
+        .unwrap_or_else(|| (0..requests.len()).collect());
+
+        let mut results = Vec::with_capacity(requests.len());
+        for index in order {
+            // Reordering deliberately breaks positional matching, which
+            // drops replay into the oracle — and the oracle answers by
+            // identity, so both calls still get their own recorded results.
+            // The permutation changes when each lands, not what it says.
+            let outcome = self.perform(requests[index].clone());
+            results.push((index, outcome));
+        }
+
+        self.current_batch = None;
+        results
+    }
+
     fn perform(&mut self, request: EffectRequest) -> Outcome {
         let identity = request.identity(&self.canon);
 
@@ -751,6 +843,14 @@ impl<C: Cas> Effects for Replayer<'_, C> {
         };
 
         match scheduled {
+            // A scheduling fault is consumed by `perform_batch`, never here.
+            // Applying it as an outcome fault would set a shadow for a call
+            // nothing was suppressed on, and the duplicate-effect check would
+            // start hedging about a call that plainly succeeded.
+            Some(fault) if fault.is_scheduling() => {
+                self.emit(&request, &observed, observed_digest, None, None);
+                observed
+            }
             Some(fault) if fault.applies_to(request.kind) => {
                 // From here the run is no longer the recorded run, and we
                 // stop expecting it to be.

@@ -168,6 +168,14 @@ pub struct Event {
     /// Monotone logical time. Samsara's clock effects return recorded wall
     /// time, but ordering is always by this, never by the wall clock.
     pub logical_time: u64,
+    /// Effects the agent issued concurrently share a batch id.
+    ///
+    /// `None` means the effect was issued on its own. The distinction
+    /// matters because the *order* two concurrent calls complete in is a
+    /// choice, not a fact — and an agent that quietly depends on that order
+    /// has a bug that only appears under load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<u64>,
 }
 
 impl Event {
@@ -230,6 +238,7 @@ mod tests {
             fault: None,
             shadow: None,
             logical_time: 3,
+            batch: None,
         };
         assert!(ev.summary().contains("\u{2026}"));
     }

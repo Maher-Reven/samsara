@@ -409,6 +409,7 @@ mod tests {
                 fault: r.fault,
                 shadow,
                 logical_time: seq as u64,
+                batch: None,
             });
         }
         (

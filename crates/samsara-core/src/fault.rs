@@ -41,6 +41,14 @@ pub enum Fault {
     /// The result is correct but arrives `ms` later, which can matter when
     /// the agent races it against a deadline.
     Delay { ms: u64 },
+    /// Concurrent calls complete in a different order.
+    ///
+    /// Unlike every other variant this does not perturb an outcome at all —
+    /// it perturbs *scheduling*. Both calls succeed exactly as recorded; only
+    /// the order the agent observes them in changes. That is enough to break
+    /// an agent that folds results into shared state as they arrive, which is
+    /// how most of them are written.
+    Reorder { seed: u64 },
 }
 
 impl Fault {
@@ -53,7 +61,45 @@ impl Fault {
             Fault::Duplicate => "duplicate".into(),
             Fault::Malformed => "malformed".into(),
             Fault::Delay { ms } => format!("delay({ms}ms)"),
+            Fault::Reorder { .. } => "reorder".into(),
         }
+    }
+
+    /// Whether this fault perturbs *when* an effect completes rather than
+    /// *what* it returns.
+    ///
+    /// Scheduling faults are consumed by the batch scheduler and must never
+    /// be applied to an outcome — in particular they must not set a shadow,
+    /// because nothing was suppressed and the duplicate-effect check would
+    /// then hedge about a call that plainly succeeded.
+    pub fn is_scheduling(&self) -> bool {
+        matches!(self, Fault::Reorder { .. })
+    }
+
+    /// A permutation of `n` items derived from this fault's seed.
+    ///
+    /// For the common case of two concurrent calls this is simply a swap.
+    /// Returns `None` for a non-scheduling fault or a batch too small to
+    /// reorder.
+    pub fn permutation(&self, n: usize) -> Option<Vec<usize>> {
+        let Fault::Reorder { seed } = self else {
+            return None;
+        };
+        if n < 2 {
+            return None;
+        }
+        let mut order: Vec<usize> = (0..n).collect();
+        let mut rng = ChaCha8Rng::seed_from_u64(*seed);
+        // Fisher-Yates, then guarantee we actually moved: a "reordering"
+        // that happens to be the identity would be a fault that does
+        // nothing, and the shrinker would rightly refuse to keep it.
+        for i in (1..n).rev() {
+            order.swap(i, rng.gen_range(0..=i));
+        }
+        if order.iter().enumerate().all(|(i, &j)| i == j) {
+            order.swap(0, n - 1);
+        }
+        Some(order)
     }
 
     /// Apply this fault to an outcome, producing what the agent will actually
@@ -67,7 +113,8 @@ impl Fault {
             Fault::Error { code } => {
                 Outcome::err(code.clone(), format!("samsara: injected error {code}"))
             }
-            Fault::Delay { .. } | Fault::Duplicate => observed.clone(),
+            // Reordering changes when a result arrives, never what it says.
+            Fault::Reorder { .. } | Fault::Delay { .. } | Fault::Duplicate => observed.clone(),
             Fault::Malformed => Outcome::Ok {
                 value: Value::String("{\"truncated\": tru".into()),
             },

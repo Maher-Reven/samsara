@@ -70,6 +70,11 @@ impl Session {
             fault: None,
             shadow: None,
             logical_time: self.logical_time,
+            // The recording proxy sees effects one at a time over HTTP and
+            // cannot yet tell "concurrently in flight" from "back to back",
+            // so it never groups them. Concurrency is modelled in-process
+            // today; see the README.
+            batch: None,
         });
         self.logical_time += 1;
         Ok(())
