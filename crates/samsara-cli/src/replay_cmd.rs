@@ -110,15 +110,178 @@ type Shared = Arc<(Mutex<Session>, Condvar)>;
 /// investigate.
 const BATCH_TIMEOUT: Duration = Duration::from_millis(2000);
 
+/// A running replay endpoint that can be driven repeatedly.
+///
+/// A sweep needs the agent run once per schedule -- hundreds of times. The
+/// server is started once and reused; only the replayer is swapped between
+/// runs. Standing up a fresh listener each time would churn several hundred
+/// ports and race with anything else on the machine.
+pub struct Harness {
+    shared: Shared,
+    base: String,
+    objects: PathBuf,
+    trace: &'static Trace,
+    stop: Arc<AtomicU64>,
+    serving: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Harness {
+    /// Start the endpoint for `trace`.
+    pub fn start(
+        trace_path: &std::path::Path,
+        port: u16,
+    ) -> Result<Harness, Box<dyn std::error::Error>> {
+        let file = std::fs::File::open(trace_path)
+            .map_err(|e| format!("cannot open {}: {e}", trace_path.display()))?;
+        let trace = Trace::read(std::io::BufReader::new(file))?;
+        let objects = crate::objects_dir(trace_path);
+
+        let (recorded, canon) = batch_layout(&trace);
+        let trace: &'static Trace = Box::leak(Box::new(trace));
+
+        let shared: Shared = Arc::new((
+            Mutex::new(Session {
+                replayer: None,
+                batches: HashMap::new(),
+                seen: Vec::new(),
+                recorded,
+                canon,
+                next_call: 0,
+            }),
+            Condvar::new(),
+        ));
+
+        let server = tiny_http::Server::http(("127.0.0.1", port))
+            .map_err(|e| format!("cannot bind 127.0.0.1:{port}: {e}"))?;
+        let stop = Arc::new(AtomicU64::new(0));
+        let serving = spawn_server(server, Arc::clone(&shared), Arc::clone(&stop));
+
+        Ok(Harness {
+            shared,
+            base: format!("http://127.0.0.1:{port}"),
+            objects,
+            trace,
+            stop,
+            serving: Some(serving),
+        })
+    }
+
+    pub fn trace(&self) -> &'static Trace {
+        self.trace
+    }
+
+    /// Run the agent once under `mode`.
+    pub fn run_once(
+        &self,
+        mode: Mode,
+        command: &[String],
+    ) -> Result<(ReplayResult, i32), Box<dyn std::error::Error>> {
+        // A fresh store handle per run. `FsCas` is a path, so leaking one
+        // per schedule costs a few hundred bytes across a whole sweep and
+        // avoids threading a borrow back out of a consumed replayer.
+        let cas: &'static mut FsCas = Box::leak(Box::new(FsCas::open(&self.objects)?));
+        let replayer = Replayer::new(self.trace, cas, mode)?;
+
+        {
+            let mut session = self.shared.0.lock().unwrap();
+            session.replayer = Some(replayer);
+            // Per-run state must not survive into the next schedule, or a
+            // batch from run seven would still be assembling in run eight.
+            session.batches.clear();
+            session.seen.clear();
+            session.next_call = 0;
+        }
+
+        let status = std::process::Command::new(&command[0])
+            .args(&command[1..])
+            .env("ANTHROPIC_BASE_URL", &self.base)
+            .env("OPENAI_BASE_URL", format!("{}/v1", self.base))
+            .env("SAMSARA_ENDPOINT", format!("{}/_samsara", self.base))
+            .env("ANTHROPIC_API_KEY", "samsara-replay-no-live-calls")
+            .env("OPENAI_API_KEY", "samsara-replay-no-live-calls")
+            .status()
+            .map_err(|e| format!("cannot run `{}`: {e}", command[0]))?;
+
+        let replayer = self
+            .shared
+            .0
+            .lock()
+            .unwrap()
+            .replayer
+            .take()
+            .expect("a replayer was installed for this run");
+
+        Ok((replayer.finish("replay"), status.code().unwrap_or(-1)))
+    }
+
+    pub fn shutdown(mut self) {
+        self.stop.store(1, Ordering::Relaxed);
+        let _ = ureq::get(&format!("{}/_samsara/ping", self.base))
+            .timeout(std::time::Duration::from_millis(250))
+            .call();
+        if let Some(handle) = self.serving.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Batch membership from a recording, in order of appearance.
+fn batch_layout(trace: &Trace) -> (Vec<Vec<Digest>>, Canonicalizer) {
+    let mut recorded: Vec<Vec<Digest>> = Vec::new();
+    let mut seen: Vec<u64> = Vec::new();
+    for event in &trace.events {
+        if let Some(batch) = event.batch {
+            match seen.iter().position(|b| *b == batch) {
+                Some(i) => recorded[i].push(event.identity.clone()),
+                None => {
+                    seen.push(batch);
+                    recorded.push(vec![event.identity.clone()]);
+                }
+            }
+        }
+    }
+    (recorded, trace.header.canonicalizer.clone())
+}
+
+fn spawn_server(
+    server: tiny_http::Server,
+    shared: Shared,
+    stop: Arc<AtomicU64>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        // Each request is handled on its own thread, and it has to be.
+        //
+        // A barrier holds early arrivals until the rest of their burst turns
+        // up -- so if the accept loop handled requests one at a time, the
+        // first call would block the loop against the very calls it is
+        // waiting for. The bound on the wait would turn that deadlock into a
+        // slow timeout, which is worse than a crash: it looks like it works.
+        let mut workers = Vec::new();
+        for request in server.incoming_requests() {
+            if stop.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            let shared = Arc::clone(&shared);
+            workers.push(std::thread::spawn(move || {
+                if let Err(e) = handle(request, &shared) {
+                    eprintln!("{} {e}", ui::yellow("replay:"));
+                }
+            }));
+            workers.retain(|w| !w.is_finished());
+        }
+        for worker in workers {
+            let _ = worker.join();
+        }
+    })
+}
+
 pub fn run(options: Options, command: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if command.is_empty() {
         return Err("nothing to run: pass the agent command after `--`".into());
     }
 
-    let file = std::fs::File::open(&options.trace)
-        .map_err(|e| format!("cannot open {}: {e}", options.trace.display()))?;
-    let trace = Trace::read(std::io::BufReader::new(file))?;
-    let cas = FsCas::open(crate::objects_dir(&options.trace))?;
+    let harness = Harness::start(&options.trace, options.port)?;
+    let trace = harness.trace();
 
     let mode = if options.strict {
         Mode::Strict
@@ -139,121 +302,15 @@ pub fn run(options: Options, command: &[String]) -> Result<(), Box<dyn std::erro
             ui::info(&format!("injecting {}", ui::yellow(&schedule.describe())))
         }
     }
-
-    // Process-lifetime data, deliberately leaked so the replayer can be
-    // `'static` and live behind a mutex. See the module docs.
-    let trace: &'static Trace = Box::leak(Box::new(trace));
-    let cas: &'static mut FsCas = Box::leak(Box::new(cas));
-
-    // Batch membership from the recording, in order of appearance.
-    let mut recorded: Vec<Vec<Digest>> = Vec::new();
-    let mut seen_ids: Vec<u64> = Vec::new();
-    for event in &trace.events {
-        if let Some(batch) = event.batch {
-            match seen_ids.iter().position(|b| *b == batch) {
-                Some(i) => recorded[i].push(event.identity.clone()),
-                None => {
-                    seen_ids.push(batch);
-                    recorded.push(vec![event.identity.clone()]);
-                }
-            }
-        }
-    }
-    if !recorded.is_empty() {
-        ui::info(&format!(
-            "{} concurrent batch(es) in the recording: {:?}",
-            recorded.len(),
-            recorded.iter().map(Vec::len).collect::<Vec<_>>()
-        ));
-    }
-    let canon = trace.header.canonicalizer.clone();
-
-    let shared: Shared = Arc::new((
-        Mutex::new(Session {
-            replayer: Some(Replayer::new(trace, cas, mode)?),
-            batches: HashMap::new(),
-            seen: Vec::new(),
-            recorded,
-            canon,
-            next_call: 0,
-        }),
-        Condvar::new(),
-    ));
-
-    let server = tiny_http::Server::http(("127.0.0.1", options.port))
-        .map_err(|e| format!("cannot bind 127.0.0.1:{}: {e}", options.port))?;
-    let base = format!("http://127.0.0.1:{}", options.port);
     ui::ok(&format!(
-        "replaying {} ({} effects) on {base}",
+        "replaying {} ({} effects)",
         options.trace.display(),
         trace.len()
     ));
 
-    let stop = Arc::new(AtomicU64::new(0));
-    let serving = {
-        let shared = Arc::clone(&shared);
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
-            // Each request is handled on its own thread, and it has to be.
-            //
-            // A barrier holds early arrivals until the rest of their burst
-            // turns up — so if the accept loop handled requests one at a
-            // time, the first call would block the loop against the very
-            // calls it is waiting for, and the batch could never assemble.
-            // The bound on the wait would turn that deadlock into a slow
-            // timeout, which is worse than a crash: it looks like it works.
-            let mut workers = Vec::new();
-            for request in server.incoming_requests() {
-                if stop.load(Ordering::Relaxed) == 1 {
-                    break;
-                }
-                let shared = Arc::clone(&shared);
-                workers.push(std::thread::spawn(move || {
-                    if let Err(e) = handle(request, &shared) {
-                        eprintln!("{} {e}", ui::yellow("replay:"));
-                    }
-                }));
-                // Reap finished handlers so a long run does not accumulate
-                // thread handles for the life of the process.
-                workers.retain(|w| !w.is_finished());
-            }
-            for worker in workers {
-                let _ = worker.join();
-            }
-        })
-    };
-
-    let status = std::process::Command::new(&command[0])
-        .args(&command[1..])
-        .env("ANTHROPIC_BASE_URL", &base)
-        .env("OPENAI_BASE_URL", format!("{base}/v1"))
-        .env("SAMSARA_ENDPOINT", format!("{base}/_samsara"))
-        // A replayed run must never reach a provider. Blanking the key means
-        // a code path we failed to intercept fails loudly instead of quietly
-        // spending money.
-        .env("ANTHROPIC_API_KEY", "samsara-replay-no-live-calls")
-        .env("OPENAI_API_KEY", "samsara-replay-no-live-calls")
-        .status()
-        .map_err(|e| format!("cannot run `{}`: {e}", command[0]))?;
-
-    stop.store(1, Ordering::Relaxed);
-    let _ = ureq::get(&format!("{base}/_samsara/ping"))
-        .timeout(std::time::Duration::from_millis(250))
-        .call();
-    let _ = serving.join();
-
-    let replayer = shared
-        .0
-        .lock()
-        .unwrap()
-        .replayer
-        .take()
-        .expect("replayer is taken once");
-    report(
-        replayer.finish("replay"),
-        &options,
-        status.code().unwrap_or(-1),
-    )
+    let (result, child_exit) = harness.run_once(mode, command)?;
+    harness.shutdown();
+    report(result, &options, child_exit)
 }
 
 fn report(
