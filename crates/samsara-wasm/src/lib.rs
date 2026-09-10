@@ -232,6 +232,56 @@ fn json<T: Serialize>(value: &T) -> String {
     serde_json::to_string(value).unwrap_or_else(|e| format!(r#"{{"error":{:?}}}"#, e.to_string()))
 }
 
+/// Open a bundle produced by `samsara bundle`.
+///
+/// A loaded trace can be *inspected* but not forked, and the distinction is
+/// real rather than a missing feature: forking means re-running the agent
+/// under different conditions, and the agent belongs to whoever recorded it.
+/// The engine has the trace, not the program that produced it. So a bundle
+/// gets its timeline, its payloads and its invariant results; counterfactuals
+/// stay with `samsara replay`, where the agent is present.
+#[wasm_bindgen]
+pub fn inspect_bundle(bundle: &str) -> String {
+    let parsed: Value = match serde_json::from_str(bundle) {
+        Ok(v) => v,
+        Err(e) => return json_err(format!("not valid JSON: {e}")),
+    };
+
+    let Some(trace_value) = parsed.get("trace") else {
+        return json_err("no `trace` field — is this a samsara bundle?".into());
+    };
+    let trace: Trace = match serde_json::from_value(trace_value.clone()) {
+        Ok(t) => t,
+        Err(e) => return json_err(format!("cannot read the trace: {e}")),
+    };
+
+    // Rebuild the object store from the bundle's payloads. Digests are
+    // recomputed from the bytes rather than trusted from the keys, so a
+    // hand-edited bundle cannot make an event point at content it does not
+    // hash to.
+    let mut cas = MemCas::new();
+    if let Some(objects) = parsed.get("objects").and_then(|v| v.as_object()) {
+        for (_, content) in objects {
+            if let Some(text) = content.as_str() {
+                let _ = cas.put(text.as_bytes());
+            }
+        }
+    }
+
+    let violations = check_all(&trace, &cas, &invariants());
+    let mut view = serde_json::to_value(view(&trace, &cas, violations, 0)).unwrap_or(Value::Null);
+    if let Some(object) = view.as_object_mut() {
+        object.insert("label".into(), Value::String(trace.header.label.clone()));
+        // Loaded traces cannot be forked; the page hides its controls.
+        object.insert("readonly".into(), Value::Bool(true));
+    }
+    json(&view)
+}
+
+fn json_err(message: String) -> String {
+    json(&serde_json::json!({ "error": message }))
+}
+
 /// Engine version, so the page can show what it is actually running.
 #[wasm_bindgen]
 pub fn version() -> String {

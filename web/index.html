@@ -131,6 +131,13 @@
   dialog button { text-align: left; width: 100%; }
   dialog .desc { display: block; font-size: 11.5px; color: var(--muted); margin-top: 3px; }
 
+  .linkish { cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
+  .linkish:hover { color: var(--accent); }
+  body.dragging { outline: 2px dashed var(--accent); outline-offset: -8px; }
+  .loaded { display: none; }
+  body.viewing .loaded { display: block; }
+  body.viewing .fork-only { display: none; }
+
   .note { margin-top: 22px; font-size: 13px; color: var(--muted); }
   .note code { font-family: var(--mono); font-size: 12px; }
   footer { margin-top: 34px; padding-top: 16px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
@@ -159,6 +166,10 @@
     <label class="toggle">
       <input type="checkbox" id="fixed"> use the fixed agent
     </label>
+    <label class="toggle file">
+      <input type="file" id="open" accept=".json,application/json" hidden>
+      <span class="linkish">open a bundle…</span>
+    </label>
   </div>
 
   <div class="lanes">
@@ -166,7 +177,7 @@
       <h2>Recording <span class="hint">click an effect to break it</span></h2>
       <ul class="events" id="recording"></ul>
     </section>
-    <section class="lane">
+    <section class="lane fork-only">
       <h2>Counterfactual <span class="hint" id="schedule">no faults</span></h2>
       <ul class="events" id="branch"></ul>
     </section>
@@ -174,7 +185,14 @@
 
   <div class="verdict" id="verdict"></div>
 
-  <p class="note">
+  <p class="note loaded">
+    You are looking at a trace you loaded. It can be inspected but not forked:
+    forking means re-running the agent under different conditions, and the
+    bundle contains the recording, not the program that produced it. Use
+    <code>samsara replay</code> for counterfactuals against your own agent.
+  </p>
+
+  <p class="note fork-only">
     The recording on the left is a run that succeeded — three effects, nothing
     wrong with it. That is the point: the bug is not in the run you have, it
     is in the run you did not have. Break the <code>delete_file</code> call
@@ -192,7 +210,7 @@
 </dialog>
 
 <script type="module">
-import init, { Session, version } from "./pkg/samsara_wasm.js";
+import init, { Session, version, inspect_bundle } from "./pkg/samsara_wasm.js";
 
 const FAULTS = [
   { label: "Timeout",        fault: { type: "timeout" },
@@ -274,6 +292,15 @@ function renderVerdict(run) {
   const node = $("verdict");
   const violations = run.violations ?? [];
 
+  if (run.loaded) {
+    node.className = violations.length ? "verdict fail" : "verdict pass";
+    node.innerHTML = violations.length
+      ? `<h3>✗ ${violations.length} invariant violated</h3>` +
+        violations.map((v) => `<p><code>${v.invariant}</code> — ${v.detail}</p>`).join("")
+      : `<h3>✓ No violations</h3><p>${run.events.length} effects, nothing broken.</p>`;
+    return;
+  }
+
   if (!points.length) {
     node.className = "verdict";
     node.innerHTML = `<h3>No faults applied</h3>
@@ -340,10 +367,33 @@ function openPalette(seq) {
 }
 
 function load() {
+  document.body.classList.remove("viewing");
   session = new Session($("fixed").checked ? "idempotent" : "naive");
   recording = JSON.parse(session.recording());
   points = [];
   refresh();
+}
+
+/** Show a bundle written by `samsara bundle`. */
+function show(run, name) {
+  if (run.error) {
+    $("verdict").className = "verdict fail";
+    $("verdict").innerHTML = `<h3>Could not open that file</h3><p>${run.error}</p>`;
+    return;
+  }
+  document.body.classList.add("viewing");
+  points = [];
+  renderEvents($("recording"), run.events, { violations: run.violations });
+  $("schedule").textContent = "";
+  document.querySelector(".lane h2").firstChild.textContent =
+    `${run.label || name} `;
+  renderVerdict({ ...run, loaded: true });
+}
+
+async function openBundle(file) {
+  if (!file) return;
+  const text = await file.text();
+  show(JSON.parse(inspect_bundle(text)), file.name);
 }
 
 await init();
@@ -352,6 +402,19 @@ load();
 
 $("reset").onclick = load;
 $("fixed").onchange = load;
+$("open").onchange = (event) => openBundle(event.target.files[0]);
+
+// Dropping a bundle anywhere on the page opens it.
+document.addEventListener("dragover", (event) => {
+  event.preventDefault();
+  document.body.classList.add("dragging");
+});
+document.addEventListener("dragleave", () => document.body.classList.remove("dragging"));
+document.addEventListener("drop", (event) => {
+  event.preventDefault();
+  document.body.classList.remove("dragging");
+  openBundle(event.dataTransfer?.files?.[0]);
+});
 
 $("search").onclick = () => {
   const button = $("search");
