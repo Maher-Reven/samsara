@@ -60,6 +60,7 @@ $ samsara demo          # no API key, no network, no cost
 
 **Using it:** [Who this is for](#who-this-is-for) ·
 [Install](#install) ·
+[API docs](https://maher-reven.github.io/samsara/docs/) ·
 [Your first sweep](#your-first-sweep) ·
 [Commands](#commands) ·
 [What it does not do yet](#what-it-does-not-do-yet)
@@ -114,18 +115,24 @@ checked against them.
 ## Install
 
 ```bash
-git clone https://github.com/Maher-Reven/samsara
-cd samsara
-cargo build --release
-./target/release/samsara --help        # or put it on your PATH
+cargo install --git https://github.com/Maher-Reven/samsara samsara-cli
+samsara --help
 ```
 
-The tool shim is not on npm yet either, so install it from the clone:
+Nothing is published to crates.io or npm, and that is deliberate rather than
+unfinished — see [Why it isn't packaged](#why-it-isnt-packaged). Installing
+from git is one command either way.
+
+The tool shim installs from the same clone:
 
 ```bash
-cd shim/typescript && npm install && npm run build
+git clone https://github.com/Maher-Reven/samsara
+cd samsara/shim/typescript && npm install && npm run build
 cd /path/to/your/agent && npm install /path/to/samsara/shim/typescript
 ```
+
+API docs for the engine are published alongside the demo:
+**[maher-reven.github.io/samsara/docs](https://maher-reven.github.io/samsara/docs/)**
 
 ## Your first sweep
 
@@ -565,6 +572,20 @@ Injects the fault schedule that seed generates and checks the resulting run
 for violations. During replay the shim never executes the real tool, so
 reproducing a delete-twice bug does not delete anything twice. Add the seed to
 CI and the build goes red if the bug comes back.
+
+## Why it isn't packaged
+
+`cargo install --git` is already a one-line install, and `cargo doc` on
+GitHub Pages already gives rendered API docs. Those are the two things
+publishing would actually buy.
+
+What publishing would also buy: a permanent claim on a good name, and a
+versioning obligation to a userbase of zero. A crate on crates.io is a
+promise that someone maintains it. Making that promise before anyone has
+asked is how the registry fills with abandoned 0.1.0s.
+
+The names are free and will be claimed the day someone wants to depend on
+this. Until then the cost of `--git` is one flag.
 
 ## What it does not do yet
 

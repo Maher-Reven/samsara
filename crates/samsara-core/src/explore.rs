@@ -212,7 +212,7 @@ fn behaviour(trace: &Trace) -> Vec<String> {
 /// A correct agent produces the same downstream effects either way; one that
 /// folds results into shared state as they land does not.
 ///
-/// This cannot be an [`Invariant`](crate::invariant::Invariant), because
+/// This cannot be an [`Invariant`] because
 /// order-dependence is not a property of one run — it is a relation between
 /// two. No single trace is wrong; the pair disagrees.
 pub fn search_order_dependence<C, F>(

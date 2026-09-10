@@ -53,6 +53,23 @@ jobs:
           wasm-bindgen --target web --no-typescript --out-dir web/pkg \
             target/wasm32-unknown-unknown/release/samsara_wasm.wasm
 
+      # Publish the API docs alongside the timeline.
+      #
+      # This is the reason not to rush onto crates.io: docs.rs is the one
+      # real benefit of publishing, and `cargo doc` on Pages delivers it
+      # without claiming a name or taking on a versioning obligation for a
+      # project with no users yet.
+      - name: Build the API docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --no-deps -p samsara-core --features testkit
+          mkdir -p web/docs
+          cp -r target/doc/* web/docs/
+          # Land on the engine rather than on an empty index.
+          echo '<meta http-equiv="refresh" content="0; url=samsara_core/index.html">' \
+            > web/docs/index.html
+
       # A page that silently ships without its engine is worse than a failed
       # build, because nobody notices until a stranger opens it.
       - name: Check the bundle is complete
@@ -61,6 +78,7 @@ jobs:
           test -f web/pkg/samsara_wasm.js
           test -s web/pkg/samsara_wasm_bg.wasm
           grep -q 'samsara_wasm.js' web/index.html
+          test -f web/docs/samsara_core/index.html
           echo "wasm: $(du -h web/pkg/samsara_wasm_bg.wasm | cut -f1)"
 
       - uses: actions/configure-pages@v5
