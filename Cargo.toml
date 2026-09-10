@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/samsara-core", "crates/samsara-cli"]
+members = ["crates/samsara-core", "crates/samsara-cli", "crates/samsara-wasm"]
 
 [workspace.package]
 version = "0.1.0"
@@ -24,3 +24,10 @@ rand = { version = "0.8", default-features = false }
 rand_chacha = "0.3"
 clap = { version = "4", features = ["derive"] }
 
+# Optimise the wasm build for size: the browser timeline is the front door,
+# and a front door that takes four seconds to open is a closed door.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

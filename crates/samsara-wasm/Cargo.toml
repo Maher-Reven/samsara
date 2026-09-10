@@ -1,0 +1,16 @@
+[package]
+name = "samsara-wasm"
+description = "WebAssembly bindings for the Samsara engine, powering the browser timeline."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+samsara-core = { path = "../samsara-core", features = ["testkit"] }
+wasm-bindgen = "0.2.128"
+serde.workspace = true
+serde_json.workspace = true
