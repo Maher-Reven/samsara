@@ -10,6 +10,7 @@ pub mod cas;
 pub mod event;
 pub mod fault;
 pub mod hash;
+pub mod invariant;
 pub mod replay;
 pub mod trace;
 
@@ -20,6 +21,9 @@ pub mod prelude {
     pub use crate::event::{EffectKind, EffectRequest, Event, Outcome};
     pub use crate::fault::{Fault, FaultPoint, FaultSchedule};
     pub use crate::hash::Digest;
+    pub use crate::invariant::{
+        check_all, Invariant, NoDuplicateEffects, TerminatesWithin, TokenBudget, Violation,
+    };
     pub use crate::replay::{
         Backend, Divergence, DivergenceKind, Effects, Mode, Recorder, ReplayResult, Replayer,
     };
