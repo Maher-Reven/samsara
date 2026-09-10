@@ -10,4 +10,18 @@ pub mod cas;
 pub mod event;
 pub mod fault;
 pub mod hash;
+pub mod replay;
 pub mod trace;
+
+/// The types you need to use Samsara, in one import.
+pub mod prelude {
+    pub use crate::canon::Canonicalizer;
+    pub use crate::cas::{Cas, FsCas, MemCas};
+    pub use crate::event::{EffectKind, EffectRequest, Event, Outcome};
+    pub use crate::fault::{Fault, FaultPoint, FaultSchedule};
+    pub use crate::hash::Digest;
+    pub use crate::replay::{
+        Backend, Divergence, DivergenceKind, Effects, Mode, Recorder, ReplayResult, Replayer,
+    };
+    pub use crate::trace::{Trace, TraceHeader};
+}
