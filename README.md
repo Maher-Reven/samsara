@@ -56,11 +56,81 @@ $ samsara demo          # no API key, no network, no cost
   ✓ seed 0 no longer reproduces — keep it as a regression test
 ```
 
+## The part that is actually different
+
+Every tool in this space injects faults at random. They can tell you a bug
+exists. None of them can tell you one doesn't, because a sample is not a
+proof and five hundred seeds is still a sample.
+
+```
+$ samsara sweep --subject fixed --pairs
+
+1. What was checked
+  • 3 faultable positions × 5 fault kinds
+  • 15 single-fault schedules (all of them)
+  • 75 pair schedules (all of them)
+  • 90 replays total (90 fault, 0 ordering)
+
+2. What it means
+  ✓ no single fault breaks this agent — all 15 were checked;
+    no pair does either, across all 75
+```
+
+That sentence is the product. It is available for one reason: **a replay
+costs nothing.** No tokens, no network, no clock. Exhaustive checking is
+normally out of reach because each trial is expensive — here no trial is, so
+the entire finite fault space simply runs, in under a second.
+
+Making the space finite is the trick. `Truncate` alone has a parameter, so
+the fault space is nominally infinite; collapsing each family to one maximally
+destructive representative (`Truncate { keep: 0 }` — survive that and you
+survive every larger keep) makes it enumerable, and therefore completable.
+
+The same applies to concurrency. Instead of shuffling a batch two hundred
+times and hoping, every ordering runs:
+
+```
+  • batch #0: 6 of 6 orderings (all of them)
+  ✗ batch #0 behaves differently under 5 of all 6 orderings
+  • 0 of 2 adjacent pairs commute
+```
+
+### The certificate
+
+A claim about coverage is worth nothing if nobody can check it, so `sweep`
+writes one:
+
+```json
+{
+  "trace": "7b8062d5cc30…",
+  "invariants": ["no_duplicate_effects", "terminates_within"],
+  "coverage": { "singles_checked": 15, "singles_exhaustive": true,
+                "pairs_checked": 75, "pairs_exhaustive": true },
+  "verdict": "clean",
+  "claims": ["no single fault breaks this agent — all 15 were checked; …"]
+}
+```
+
+It contains no timestamps, durations or hostnames — everything in it is a
+function of the trace and the engine version, so two runs produce identical
+bytes. That is what makes it worth committing. `samsara sweep --check`
+re-runs and exits non-zero on any difference, and the difference worth
+catching is not a new failure. It is coverage quietly shrinking while the
+verdict stays green:
+
+```
+✗ pair coverage 75 → 0
+```
+
+A gate that only compared pass/fail would wave that through.
+`certificates/` holds this repo's own, and CI re-checks them.
+
 ## Try it
 
 ```bash
-cargo run --bin samsara -- demo     # the worked example above
-cargo run --bin samsara -- emit     # write demo traces to ./traces
+cargo run --bin samsara -- demo               # the worked example above
+cargo run --bin samsara -- sweep --pairs      # check the whole fault space
+cargo run --bin samsara -- emit               # write demo traces to ./traces
 cargo run --bin samsara -- show traces/counterfactual.samsara.jsonl
 ```
 
@@ -334,10 +404,12 @@ position stays well defined after the fork, and says what you actually mean:
 
 ```
 crates/samsara-core    engine: trace, CAS, canonicalisation, replay, faults,
-                       shrinking, invariants, batch scheduling  (68 tests)
-crates/samsara-cli     the `samsara` binary: record, replay, verify, and
-                       end-to-end tests driving it against a stub provider
-                       (14 tests)
+                       shrinking, invariants, batch scheduling, exhaustive
+                       coverage, certificates  (85 tests)
+crates/samsara-cli     the `samsara` binary: record, replay, sweep, verify,
+                       and end-to-end tests driving it against a stub
+                       provider  (20 tests)
+certificates/          committed coverage claims, re-checked by CI
 crates/samsara-wasm    WebAssembly bindings for the timeline
 shim/typescript        the tool-side shim  (12 tests)
 web/                   the browser timeline, and a contract test pinning
@@ -346,18 +418,49 @@ web/                   the browser timeline, and a contract test pinning
 
 ## Prior art
 
-Record/replay debugging is old and well understood — [`rr`][rr] for native
-code, [FoundationDB's deterministic simulation][fdb] for distributed systems.
-Applying it to agents is recent: [AgentRR][agentrr], [AgentCheck][agentcheck]
-and [Causal Agent Replay][car] all explore the same territory from the research
-side. Samsara is the engineering counterpart — a tool you can point at your own
-agent this afternoon.
+Most of what Samsara does has been done before, and it is worth being
+specific about which parts.
 
+**Record/replay of LLM calls is solved.** [`standin`][standin] records and
+replays LLM API calls across every major provider, with streaming, tool calls
+and secret redaction. So do [`vcr-langchain`][vcrlc], [ReqCassette][req], and
+the whole [VCR][vcr] lineage behind them. Samsara's proxy and trace format
+cover ground these already cover well.
+
+**Deterministic simulation testing is decades old.** [FoundationDB][fdb],
+[Antithesis][antithesis], [madsim and turmoil][dst] — seeded fault schedules,
+single-threaded simulation, reproduce-from-seed. Samsara borrows the method
+wholesale; the FDB write-up is the best introduction to it.
+
+**Chaos injection for agents already ships.** [`agent-chaos`][agentchaos] does
+LLM and tool faults, composable and targetable. [AgentChaos][agentchaospaper]
+makes the same architectural call Samsara does — inject at the shared HTTP
+layer so no source changes are needed. [AgentCheck][agentcheck]'s shared
+response cache is close to the identity-indexed oracle here.
+
+Three things I could not find anywhere:
+
+1. **Exhaustive bounded coverage** — enumerating the whole single-fault space
+   and saying so, rather than sampling it. Everything above searches randomly.
+2. **The landing model and shadow outcome** — the retry/idempotency problem is
+   widely recognised, but asserting a duplicate side effect *with certainty*,
+   by recording the outcome a fault suppressed, is not something I found.
+3. **Order-dependence as a relation between two runs**, with each batch's
+   internal order discarded before comparing so correct agents are not flagged.
+
+Even those are a novel combination rather than a novel invention.
+
+[standin]: https://pypi.org/project/standin/
+[vcrlc]: https://github.com/amosjyng/vcr-langchain
+[req]: https://github.com/lostbean/req_cassette
+[vcr]: https://github.com/vcr/vcr
 [rr]: https://rr-project.org/
 [fdb]: https://apple.github.io/foundationdb/testing.html
-[agentrr]: https://arxiv.org/pdf/2505.17716
+[antithesis]: https://antithesis.com
+[dst]: https://github.com/ivanyu/awesome-deterministic-simulation-testing
+[agentchaos]: https://github.com/deepankarm/agent-chaos
+[agentchaospaper]: https://arxiv.org/abs/2608.06790
 [agentcheck]: https://arxiv.org/html/2607.11098
-[car]: https://arxiv.org/pdf/2606.08275
 
 ## License
 

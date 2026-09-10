@@ -40,6 +40,16 @@ jobs:
           cargo run --bin samsara -- demo
           cargo run --bin samsara -- demo --scenario order
 
+      # The repo's own coverage gate. Fails if a change alters what gets
+      # checked -- including coverage shrinking while everything still
+      # passes, which a verdict-only gate would wave through.
+      - name: Certificates still hold
+        run: |
+          cargo run --bin samsara -- sweep --subject fixed --pairs \
+            --check certificates/fixed-agent.json
+          cargo run --bin samsara -- sweep --subject order \
+            --check certificates/assembling-agent.json
+
       # `verify` exits non-zero on a violation, which is how it is meant to
       # be used in a real pipeline. Here we assert it does exactly that.
       - name: Verify detects the known-bad trace
