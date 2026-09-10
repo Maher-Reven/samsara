@@ -5,7 +5,7 @@
 //! nobody runs.
 
 use samsara_core::prelude::*;
-use samsara_core::testkit::{run_agent, FakeBackend, Style, WorldAccess};
+use samsara_core::testkit::{run_agent, run_assembler, Assembly, FakeBackend, Style, WorldAccess};
 
 use crate::ui;
 
@@ -274,5 +274,110 @@ pub fn emit(dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         std::fs::write(&path, t.to_jsonl())?;
         ui::ok(&format!("{} \u{2014} {} effects", path.display(), t.len()));
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: concurrent tool calls
+// ---------------------------------------------------------------------------
+
+fn record_assembly(assembly: Assembly) -> (Trace, MemCas, Vec<String>) {
+    let mut cas = MemCas::new();
+    let mut recorder = Recorder::new(FakeBackend::new(1), &mut cas, Canonicalizer::default());
+    let document = run_assembler(&mut recorder, assembly);
+    (recorder.finish("assemble-report"), cas, document)
+}
+
+/// The quiet bug: three sections rendered concurrently, folded into a
+/// document as they arrive.
+pub fn order(seeds: u64) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "\n{}\n{}",
+        ui::bold("samsara demo \u{2014} an order-dependent bug in concurrent tool calls"),
+        ui::dim("no network, no API key, no cost")
+    );
+
+    ui::heading(1, "Record a normal run");
+    let (trace, mut cas, document) = record_assembly(Assembly::AsTheyArrive);
+    for event in &trace.events {
+        let line = event.summary();
+        match event.batch {
+            Some(b) => println!(
+                "     {}  {}",
+                ui::dim(&line),
+                ui::cyan(&format!("batch {b}"))
+            ),
+            None => println!("     {}", ui::dim(&line)),
+        }
+    }
+    ui::ok(&format!(
+        "document assembled as {}",
+        ui::bold(&document.join(" + "))
+    ));
+    ui::info("three sections were rendered concurrently \u{2014} note the shared batch");
+
+    ui::heading(2, "Nothing is wrong with this run");
+    let invariants: Vec<Box<dyn Invariant>> = vec![
+        Box::new(NoDuplicateEffects::all()),
+        Box::new(TerminatesWithin(24)),
+    ];
+    if check_all(&trace, &cas, &invariants).is_empty() {
+        ui::ok("no duplicate effects, no runaway, every call succeeded");
+        ui::info("no invariant can catch this, because no single run is wrong");
+    }
+
+    ui::heading(3, "Ask whether the order mattered");
+    ui::info(&format!(
+        "permuting the batch across {seeds} seeds and comparing behaviour"
+    ));
+
+    let Some(finding) = search_order_dependence(&trace, &mut cas, 0..seeds, |replayer| {
+        run_assembler(replayer, Assembly::AsTheyArrive);
+    }) else {
+        ui::ok("no ordering changed what the agent did");
+        return Ok(());
+    };
+    ui::bad(&finding.report());
+
+    ui::heading(4, "See the damage");
+    let schedule = FaultSchedule::of(vec![FaultPoint {
+        seq: finding.at_seq,
+        fault: Fault::Reorder { seed: finding.seed },
+    }]);
+    let mut replayer = Replayer::new(&trace, &mut cas, Mode::Counterfactual { schedule })?;
+    let reordered = run_assembler(&mut replayer, Assembly::AsTheyArrive);
+    let result = replayer.finish("reordered");
+
+    println!(
+        "     {} {}",
+        ui::dim("recorded: "),
+        ui::green(&document.join(" + "))
+    );
+    println!(
+        "     {} {}",
+        ui::dim("reordered:"),
+        ui::red(&reordered.join(" + "))
+    );
+    ui::info("every call succeeded; the document is simply wrong");
+    if !result.holes.is_empty() {
+        ui::info(&format!(
+            "the save that follows has no recorded answer ({} hole) \u{2014} the agent has \
+             left the behaviour we observed, which is itself the finding",
+            result.holes.len()
+        ));
+    }
+
+    ui::heading(5, "Apply the fix");
+    ui::info("place each result at the index it was requested from, not where it landed");
+    let (fixed, mut fixed_cas, _) = record_assembly(Assembly::ByRequestOrder);
+    let still = search_order_dependence(&fixed, &mut fixed_cas, 0..seeds, |replayer| {
+        run_assembler(replayer, Assembly::ByRequestOrder);
+    });
+    match still {
+        None => ui::ok(&format!("survives all {seeds} permutations")),
+        Some(f) => ui::bad(&f.report()),
+    }
+
+    println!();
     Ok(())
 }

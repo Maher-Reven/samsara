@@ -171,6 +171,56 @@ samsara verify run.samsara.jsonl \
   --idempotency-key idempotency_key
 ```
 
+## Concurrent tool calls
+
+Some bugs are not failures. Every call succeeds, nothing retries, no budget is
+exceeded — and the agent still produces the wrong answer, because two results
+came back in the other order.
+
+```
+$ samsara demo --scenario order
+
+1. Record a normal run
+         0 model   claude-sonnet-4          ab737d1cec25
+         1 tool    render_section           13e9bd8f2ee7  batch 0
+         2 tool    render_section           2d3e94c1d8e0  batch 0
+         3 tool    render_section           5f37c58803e0  batch 0
+         4 tool    save_document            4e7c1c229df8
+  ✓ document assembled as <intro> + <summary> + <appendix>
+
+2. Nothing is wrong with this run
+  ✓ no duplicate effects, no runaway, every call succeeded
+  • no invariant can catch this, because no single run is wrong
+
+3. Ask whether the order mattered
+  ✗ concurrent batch #0 is order-dependent — reordering it with seed 0
+    changes effect #4
+      in request order: tool:save_document:4e7c1c229df8
+      reordered:        tool:save_document:5ee530d71bc6
+
+4. See the damage
+     recorded:  <intro> + <summary> + <appendix>
+     reordered: <appendix> + <summary> + <intro>
+
+5. Apply the fix
+  ✓ survives all 200 permutations
+```
+
+**Testing order-dependence does not need threads, it needs control over
+order** — and real concurrency gives you the opposite. So `perform_batch` runs
+the calls one at a time and *chooses* the sequence, which is what a
+deterministic simulator does and why a finding reproduces from a seed. The
+model is faithful precisely where it matters: an agent that collects results
+and sorts them by index is unaffected by any permutation, and correctly so; an
+agent that folds each result into shared state as it lands is not.
+
+This cannot be an invariant, because order-dependence is not a property of one
+run — it is a relation between two. No single trace is wrong; the pair
+disagrees. So Samsara runs the agent with calls completing in request order,
+runs it again permuted, and compares what it *did afterwards*, with each
+batch's internal order discarded (otherwise every well-behaved agent would
+look guilty).
+
 ## Replaying it
 
 Feed a recorded trace back into your real agent process. Nothing leaves the
@@ -209,9 +259,11 @@ Stated plainly, because a README that only lists strengths is not worth reading:
   — is out of reach.
 - **Streaming responses are recorded whole.** Chunk boundaries are not
   preserved, so mid-stream truncation faults are unavailable for model calls.
-- **Parallel tool calls are not scheduled.** Effects are a linear sequence;
-  there is no deterministic interleaving of concurrent calls, so
-  reordering bugs are out of reach. This is the largest gap.
+- **The proxy does not yet group concurrent calls.** Order-dependence is
+  modelled in-process through `perform_batch`; over HTTP the proxy cannot yet
+  tell "concurrently in flight" from "back to back", so traces recorded from a
+  real agent carry no batches. Closing that needs a barrier in the tool
+  protocol, with the deadlock risk that implies.
 - **The oracle is content-addressed, not state-aware.** A stateful tool
   (`stat` before and after a write) returns its recorded answers in order and
   then holds the last one, which is right for retries and wrong for polling.
@@ -258,7 +310,7 @@ position stays well defined after the fork, and says what you actually mean:
 
 ```
 crates/samsara-core    engine: trace, CAS, canonicalisation, replay, faults,
-                       shrinking, invariants  (59 tests)
+                       shrinking, invariants, batch scheduling  (67 tests)
 crates/samsara-cli     the `samsara` binary: record, replay, verify, and
                        end-to-end tests driving it against a stub provider
                        (10 tests)

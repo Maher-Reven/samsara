@@ -25,6 +25,16 @@ struct Cli {
     command: Command,
 }
 
+/// The worked examples.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum Scenario {
+    /// A tool times out, the agent retries, and the side effect happens twice.
+    Retry,
+    /// Concurrent tool calls complete in a different order, and the agent
+    /// quietly produces the wrong result.
+    Order,
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Run the worked example end to end: find a duplicate side effect,
@@ -32,6 +42,9 @@ enum Command {
     ///
     /// Needs no API key and touches no network.
     Demo {
+        /// Which failure to walk through.
+        #[arg(long, value_enum, default_value_t = Scenario::Retry)]
+        scenario: Scenario,
         /// How many seeds to try before giving up.
         #[arg(long, default_value_t = 500)]
         seeds: u64,
@@ -158,7 +171,14 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     match Cli::parse().command {
-        Command::Demo { seeds, max_faults } => demo::run(seeds, max_faults),
+        Command::Demo {
+            scenario,
+            seeds,
+            max_faults,
+        } => match scenario {
+            Scenario::Retry => demo::run(seeds, max_faults),
+            Scenario::Order => demo::order(seeds.min(200)),
+        },
         Command::Record { out, port, command } => record::run(&out, port, &command),
         Command::Replay {
             trace,

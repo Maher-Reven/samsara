@@ -36,7 +36,9 @@ jobs:
       # The worked example is executable documentation. If the README's
       # output stops being true, the build should notice.
       - name: Demo
-        run: cargo run --bin samsara -- demo
+        run: |
+          cargo run --bin samsara -- demo
+          cargo run --bin samsara -- demo --scenario order
 
       # `verify` exits non-zero on a violation, which is how it is meant to
       # be used in a real pipeline. Here we assert it does exactly that.
