@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/samsara-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/maherkurdi/samsara"
+rust-version = "1.75"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+thiserror = "1"
+# `default-features = false` drops `getrandom`, and that is deliberate rather
+# than incidental: Samsara never draws from OS entropy. Every random value is
+# derived from an explicit seed, because a run that reaches for real
+# randomness is a run that cannot be reproduced. Dropping the dependency makes
+# that a compile-time guarantee instead of a convention — and, usefully, is
+# also what lets the engine compile to wasm32-unknown-unknown at all.
+rand = { version = "0.8", default-features = false }
+rand_chacha = "0.3"
+
