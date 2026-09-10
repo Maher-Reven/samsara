@@ -37,6 +37,7 @@
 
 pub mod canon;
 pub mod cas;
+pub mod certificate;
 pub mod event;
 pub mod explore;
 pub mod fault;
@@ -53,9 +54,11 @@ pub mod testkit;
 pub mod prelude {
     pub use crate::canon::Canonicalizer;
     pub use crate::cas::{Cas, FsCas, MemCas};
+    pub use crate::certificate::{Certificate, Verdict};
     pub use crate::event::{EffectKind, EffectRequest, Event, Outcome};
     pub use crate::explore::{
-        evaluate, minimise, search, search_order_dependence, Finding, OrderDependence,
+        evaluate, interleavings, minimise, search, search_order_dependence, sweep, Case, Coverage,
+        Finding, Interleavings, OrderDependence,
     };
     pub use crate::fault::{Fault, FaultPoint, FaultSchedule};
     pub use crate::hash::Digest;

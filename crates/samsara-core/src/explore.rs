@@ -16,6 +16,7 @@ use crate::invariant::{Invariant, Violation};
 use crate::replay::{Mode, Replayer};
 use crate::shrink::{shrink, Shrunk};
 use crate::trace::Trace;
+use serde::{Deserialize, Serialize};
 
 /// A schedule that breaks the agent.
 #[derive(Clone, Debug)]
@@ -275,4 +276,380 @@ where
 
 fn first_difference_at(a: &[String], b: &[String]) -> Option<usize> {
     (0..a.len().max(b.len())).find(|&i| a.get(i) != b.get(i))
+}
+
+// ---------------------------------------------------------------------------
+// Exhaustive coverage
+// ---------------------------------------------------------------------------
+
+/// A schedule that broke something, found by enumeration rather than search.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Case {
+    pub schedule: FaultSchedule,
+    pub description: String,
+    pub violations: Vec<Violation>,
+}
+
+/// What a sweep actually checked, and what it found.
+///
+/// The counts matter as much as the findings. "No single fault breaks this
+/// agent" is only worth saying if you can also say how many single faults
+/// there were, and that every one of them ran.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Coverage {
+    /// Effect positions a fault can attach to.
+    pub positions: usize,
+    /// Distinct fault kinds tried at each position.
+    pub kinds: usize,
+    /// Single-fault schedules executed.
+    pub singles_checked: usize,
+    /// Whether every single-fault schedule ran. False only if the budget ran
+    /// out, which would make the headline claim unavailable.
+    pub singles_exhaustive: bool,
+    /// Two-fault schedules executed.
+    pub pairs_checked: usize,
+    /// Whether every two-fault schedule ran.
+    pub pairs_exhaustive: bool,
+    /// Total replays performed.
+    pub replays: usize,
+    /// Everything that broke.
+    pub failures: Vec<Case>,
+}
+
+impl Coverage {
+    /// The strongest true statement about this run.
+    ///
+    /// Deliberately refuses to overstate: if the budget cut the sweep short,
+    /// it says so rather than implying completeness it did not achieve.
+    pub fn claim(&self) -> String {
+        let mut parts = Vec::new();
+
+        let singles = if self.singles_exhaustive {
+            match self
+                .failures
+                .iter()
+                .filter(|c| c.schedule.len() == 1)
+                .count()
+            {
+                0 => format!(
+                    "no single fault breaks this agent \u{2014} all {} were checked",
+                    self.singles_checked
+                ),
+                n => format!("{n} of {} single faults break it", self.singles_checked),
+            }
+        } else {
+            format!(
+                "{} of the single faults checked (budget reached, not exhaustive)",
+                self.singles_checked
+            )
+        };
+        parts.push(singles);
+
+        if self.pairs_checked > 0 {
+            let broken = self
+                .failures
+                .iter()
+                .filter(|c| c.schedule.len() == 2)
+                .count();
+            let scope = if self.pairs_exhaustive {
+                "all"
+            } else {
+                "a sample of"
+            };
+            parts.push(match broken {
+                0 => format!("no pair does either, across {scope} {}", self.pairs_checked),
+                n => format!("{n} pairs do, across {scope} {}", self.pairs_checked),
+            });
+        }
+        parts.join("; ")
+    }
+
+    /// Whether anything broke.
+    pub fn is_clean(&self) -> bool {
+        self.failures.is_empty()
+    }
+}
+
+/// Check **every** single-fault schedule, then as many pairs as the budget
+/// allows.
+///
+/// This is the difference between testing and verification, and it is
+/// available only because replay is free: a run costs no tokens and no
+/// network, so enumerating hundreds of them is a second of CPU rather than a
+/// bill. Random seed search is what you do when each attempt is expensive.
+/// Nothing here is expensive.
+pub fn sweep<C, F>(
+    trace: &Trace,
+    cas: &mut C,
+    invariants: &[Box<dyn Invariant>],
+    max_replays: usize,
+    include_pairs: bool,
+    mut drive: F,
+) -> Coverage
+where
+    C: Cas,
+    F: FnMut(&mut Replayer<'_, C>),
+{
+    let positions = trace.faultable();
+    let kinds = Fault::canonical_set();
+    let mut coverage = Coverage {
+        positions: positions.len(),
+        kinds: kinds.len(),
+        singles_checked: 0,
+        singles_exhaustive: true,
+        pairs_checked: 0,
+        pairs_exhaustive: false,
+        replays: 0,
+        failures: Vec::new(),
+    };
+
+    let mut run = |schedule: FaultSchedule, cov: &mut Coverage, drive: &mut F| {
+        cov.replays += 1;
+        let violations = evaluate(trace, cas, schedule.clone(), invariants, drive);
+        if !violations.is_empty() {
+            cov.failures.push(Case {
+                description: schedule.describe(),
+                schedule,
+                violations,
+            });
+        }
+    };
+
+    // --- every single fault ---
+    'singles: for &seq in &positions {
+        for fault in &kinds {
+            if coverage.replays >= max_replays {
+                coverage.singles_exhaustive = false;
+                break 'singles;
+            }
+            let schedule = FaultSchedule::of(vec![FaultPoint {
+                seq,
+                fault: fault.clone(),
+            }]);
+            run(schedule, &mut coverage, &mut drive);
+            coverage.singles_checked += 1;
+        }
+    }
+
+    if !include_pairs || !coverage.singles_exhaustive {
+        return coverage;
+    }
+
+    // --- every pair of positions, every combination of kinds ---
+    let mut exhaustive = true;
+    'pairs: for (i, &a) in positions.iter().enumerate() {
+        for &b in &positions[i + 1..] {
+            for fa in &kinds {
+                for fb in &kinds {
+                    if coverage.replays >= max_replays {
+                        exhaustive = false;
+                        break 'pairs;
+                    }
+                    let schedule = FaultSchedule::of(vec![
+                        FaultPoint {
+                            seq: a,
+                            fault: fa.clone(),
+                        },
+                        FaultPoint {
+                            seq: b,
+                            fault: fb.clone(),
+                        },
+                    ]);
+                    run(schedule, &mut coverage, &mut drive);
+                    coverage.pairs_checked += 1;
+                }
+            }
+        }
+    }
+    coverage.pairs_exhaustive = exhaustive;
+    coverage
+}
+
+// ---------------------------------------------------------------------------
+// Exhaustive interleaving
+// ---------------------------------------------------------------------------
+
+/// What an interleaving check covered.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Interleavings {
+    /// Batch id.
+    pub batch: u64,
+    /// Number of concurrent calls in it.
+    pub width: usize,
+    /// Total orderings that exist: `width!`.
+    pub total: usize,
+    /// Orderings actually executed.
+    pub checked: usize,
+    /// True when every ordering ran, so "order-independent" is a statement
+    /// about all of them rather than about a sample.
+    pub exhaustive: bool,
+    /// Pairs of positions that commute: swapping them adjacently left the
+    /// agent's downstream behaviour unchanged.
+    pub commuting_pairs: usize,
+    /// Total adjacent pairs examined.
+    pub adjacent_pairs: usize,
+    /// Orderings under which the agent behaved differently from the
+    /// recorded one.
+    pub divergent: Vec<Vec<usize>>,
+    /// Replays this check cost. Reported separately from the fault sweep so
+    /// a total is a total rather than a subset presented as one.
+    pub replays: usize,
+}
+
+impl Interleavings {
+    pub fn is_order_independent(&self) -> bool {
+        self.divergent.is_empty()
+    }
+
+    pub fn claim(&self) -> String {
+        let scope = if self.exhaustive {
+            format!("all {} orderings", self.total)
+        } else {
+            format!("{} of {} orderings", self.checked, self.total)
+        };
+        if self.divergent.is_empty() {
+            format!("batch #{} is order-independent across {scope}", self.batch)
+        } else {
+            format!(
+                "batch #{} behaves differently under {} of {scope}",
+                self.batch,
+                self.divergent.len()
+            )
+        }
+    }
+}
+
+/// Largest batch width worth enumerating exhaustively.
+///
+/// 7! is 5040 replays, which is about a second. 8! is eight times that and
+/// the returns stop justifying it; beyond this the check reports a sample
+/// and says so rather than quietly pretending.
+const EXHAUSTIVE_WIDTH: usize = 7;
+
+/// Check a concurrent batch against **every** ordering.
+///
+/// The claim this supports is categorically stronger than random
+/// permutation: not "it survived two hundred shuffles" but "there is no
+/// ordering under which it behaves differently", which for a batch of five
+/// is a statement about all one hundred and twenty.
+///
+/// It is affordable for the same reason the fault sweep is: a replay costs
+/// nothing. Exhaustive checking is normally out of reach because each trial
+/// is expensive. Here no trial is.
+pub fn interleavings<C, F>(trace: &Trace, cas: &mut C, mut drive: F) -> Vec<Interleavings>
+where
+    C: Cas,
+    F: FnMut(&mut Replayer<'_, C>),
+{
+    let run = |cas: &mut C, schedule: FaultSchedule, drive: &mut F| -> Vec<String> {
+        let mut replayer = Replayer::new(trace, cas, Mode::Counterfactual { schedule })
+            .expect("replayer construction reads only the store");
+        drive(&mut replayer);
+        behaviour(&replayer.finish("interleaving").branch)
+    };
+
+    let baseline = run(cas, FaultSchedule::empty(), &mut drive);
+
+    // Every batch in the recording, with where it starts and how wide it is.
+    let mut batches: Vec<(u64, u64, usize)> = Vec::new();
+    for event in &trace.events {
+        if let Some(batch) = event.batch {
+            match batches.iter_mut().find(|(b, _, _)| *b == batch) {
+                Some((_, _, width)) => *width += 1,
+                None => batches.push((batch, event.seq, 1)),
+            }
+        }
+    }
+
+    let mut reports = Vec::new();
+    for (batch, at_seq, width) in batches {
+        let total = (1..=width).product::<usize>();
+        let exhaustive = width <= EXHAUSTIVE_WIDTH;
+
+        let mut checked = 0usize;
+        let mut divergent = Vec::new();
+
+        let orders: Vec<Vec<usize>> = if exhaustive {
+            permutations(width)
+        } else {
+            // Beyond the bound, fall back to seeded sampling and say so.
+            (0..512u64)
+                .filter_map(|seed| Fault::Reorder { seed }.permutation(width))
+                .collect()
+        };
+
+        for order in &orders {
+            // The identity ordering is the recording; running it proves
+            // nothing and would count toward coverage dishonestly.
+            if order.iter().enumerate().all(|(i, &j)| i == j) {
+                continue;
+            }
+            let schedule = FaultSchedule::of(vec![FaultPoint {
+                seq: at_seq,
+                fault: Fault::Exact {
+                    order: order.clone(),
+                },
+            }]);
+            checked += 1;
+            if run(cas, schedule, &mut drive) != baseline {
+                divergent.push(order.clone());
+            }
+        }
+
+        // Which adjacent pairs commute? Cheap to compute from what we ran,
+        // and the useful diagnostic: it says *which* two calls are entangled
+        // rather than only that something is.
+        let mut commuting = 0usize;
+        let mut adjacent = 0usize;
+        for i in 0..width.saturating_sub(1) {
+            adjacent += 1;
+            let mut order: Vec<usize> = (0..width).collect();
+            order.swap(i, i + 1);
+            let schedule = FaultSchedule::of(vec![FaultPoint {
+                seq: at_seq,
+                fault: Fault::Exact { order },
+            }]);
+            if run(cas, schedule, &mut drive) == baseline {
+                commuting += 1;
+            }
+        }
+
+        reports.push(Interleavings {
+            batch,
+            width,
+            total,
+            checked: checked + 1, // the recorded ordering counts as covered
+            exhaustive,
+            commuting_pairs: commuting,
+            adjacent_pairs: adjacent,
+            divergent,
+            replays: checked + adjacent,
+        });
+    }
+    reports
+}
+
+/// All permutations of `0..n`, in a deterministic order.
+fn permutations(n: usize) -> Vec<Vec<usize>> {
+    let mut out = Vec::new();
+    let mut current: Vec<usize> = (0..n).collect();
+    heap(&mut current, n, &mut out);
+    out.sort();
+    out
+}
+
+/// Heap's algorithm.
+fn heap(items: &mut Vec<usize>, k: usize, out: &mut Vec<Vec<usize>>) {
+    if k <= 1 {
+        out.push(items.clone());
+        return;
+    }
+    for i in 0..k {
+        heap(items, k - 1, out);
+        if k % 2 == 0 {
+            items.swap(i, k - 1);
+        } else {
+            items.swap(0, k - 1);
+        }
+    }
 }
