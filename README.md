@@ -56,6 +56,171 @@ $ samsara demo          # no API key, no network, no cost
   ✓ seed 0 no longer reproduces — keep it as a regression test
 ```
 
+<!-- toc -->
+
+**Using it:** [Who this is for](#who-this-is-for) ·
+[Install](#install) ·
+[Your first sweep](#your-first-sweep) ·
+[Commands](#commands) ·
+[What it does not do yet](#what-it-does-not-do-yet)
+
+**How it works:** [The idea](#the-idea) ·
+[Exhaustive coverage](#the-part-that-is-actually-different) ·
+[Concurrency](#concurrent-tool-calls) ·
+[Is replay faithful?](#is-replay-actually-faithful) ·
+[Notes from the build](#notes-from-the-build) ·
+[Prior art](#prior-art)
+
+## Who this is for
+
+You have an agent that calls tools which **change something** — delete a file,
+charge a card, send an email, write to a database — and you cannot answer the
+question *"what happens if one of those calls fails at the wrong moment?"*
+except by waiting to find out.
+
+Concretely, Samsara is worth your time if:
+
+- Your agent retries failed tool calls. (Almost all do.)
+- At least one of your tools is not safe to run twice.
+- You have ever seen a bug you could not reproduce.
+
+**It is not for you if** you are measuring answer quality — that is an evals
+problem and [Braintrust][braintrust], [Langfuse][langfuse] and others do it
+properly. Samsara says nothing about whether your agent gave a good answer. It
+only says whether it can be made to do something it must never do.
+
+### What you need
+
+| | |
+|---|---|
+| **Rust 1.88+** | to build the CLI. Nothing is published yet, so you build from source. |
+| **Node 20+** | only if you want tool-call coverage, which needs the shim. |
+| **An agent that talks HTTP to a provider** | any language. The proxy is the configured base URL, so there is no SDK to swap. |
+| **Nothing else** | no API key, no account, no network after recording once. |
+
+Model calls work with any language today. **Tool calls need a shim, and only
+TypeScript has one** — a Python port is an afternoon, because the shim carries
+no logic, but it does not exist yet. Without a shim you still get model-call
+replay and divergence detection; you do not get tool fault injection, which is
+where most of the value is.
+
+Request shapes are tuned for Anthropic. OpenAI-style requests record and
+replay, but the canonicaliser's default volatile-path list has not been
+checked against them.
+
+[braintrust]: https://braintrust.dev
+[langfuse]: https://langfuse.com
+
+## Install
+
+```bash
+git clone https://github.com/Maher-Reven/samsara
+cd samsara
+cargo build --release
+./target/release/samsara --help        # or put it on your PATH
+```
+
+The tool shim is not on npm yet either, so install it from the clone:
+
+```bash
+cd shim/typescript && npm install && npm run build
+cd /path/to/your/agent && npm install /path/to/samsara/shim/typescript
+```
+
+## Your first sweep
+
+Five steps, from nothing to *"no single fault breaks this."*
+
+**1. Wrap your tools.** This is the only change to your code, and it is a
+no-op unless Samsara is attached, so it is safe to leave in.
+
+```ts
+import { wrapTools } from "@samsara/shim";
+
+const tools = wrapTools({
+  charge_card:  async (args) => billing.charge(args),
+  send_receipt: async (args) => mailer.send(args),
+});
+```
+
+**2. Declare what must never happen.** `samsara init` writes a template.
+Samsara cannot guess which of your tools change the world — that is the one
+thing only you know.
+
+```toml
+# samsara.toml
+[[invariant]]
+type = "no_duplicate_effects"
+tools = ["charge_card", "send_receipt"]
+
+[[invariant]]
+type = "never_after_failure"
+tool = "send_receipt"
+after = "charge_card"
+```
+
+**3. Record one real run.** This is the only step that spends money.
+
+```bash
+samsara record --out run.samsara.jsonl -- npm start
+```
+
+You now have `run.samsara.jsonl` and a `run.samsara.objects/` beside it.
+Commit both — they are your fixture, and everything after this is free.
+
+**4. Break it, exhaustively.**
+
+```bash
+samsara sweep run.samsara.jsonl --pairs -- npm start
+```
+
+Your agent runs once per fault schedule against recorded responses. No
+tokens, no network. A few hundred runs takes seconds.
+
+```
+  • 15 single-fault schedules (all of them)
+  • 75 pair schedules (all of them)
+  ✗ 2 of 15 single faults break it
+     #1 timeout
+       [no_duplicate_effects] `charge_card` took effect at #1 and again
+       at #2 — the side effect happened twice
+```
+
+**5. Fix it, then keep it fixed.** Write a certificate and check it in CI:
+
+```bash
+samsara sweep run.samsara.jsonl --pairs --out samsara.cert.json -- npm start
+# in CI:
+samsara sweep run.samsara.jsonl --pairs --check samsara.cert.json -- npm start
+```
+
+The check fails on a new bug *and* on coverage quietly shrinking, which a
+pass/fail gate would miss. It also fails when you *fix* something —
+
+```
+✗ verdict changed: Broken → Clean
+✗ failing schedules 22 → 0
+```
+
+— because the certificate is now stale and should be re-issued. Like any
+snapshot, it is a record of what you last agreed to, not a floor.
+
+## Commands
+
+| | |
+|---|---|
+| `samsara init` | write a starting `samsara.toml` |
+| `samsara record -- <cmd>` | run your agent, capture every effect |
+| `samsara sweep <trace> -- <cmd>` | check every fault; write or check a certificate |
+| `samsara replay <trace> --strict -- <cmd>` | did my agent change? |
+| `samsara replay <trace> --seed N -- <cmd>` | reproduce one specific failure |
+| `samsara verify <trace>` | check a recorded run against your properties |
+| `samsara show <trace>` | print a trace |
+| `samsara bundle <trace>` | package a trace for the [browser timeline](https://maher-reven.github.io/samsara/) |
+| `samsara demo` | the worked example, no setup at all |
+
+Every command that can fail exits non-zero, so all of them work as CI gates.
+
 ## The part that is actually different
 
 Every tool in this space injects faults at random. They can tell you a bug
@@ -306,8 +471,9 @@ const tools = wrapTools({
 });
 ```
 
-`wrapTools` is a no-op when `SAMSARA_ENDPOINT` is unset, so it costs nothing in
-production. Then check a trace in CI — it exits non-zero on a violation:
+The package is not on npm yet, so install it from a clone — see
+[Install](#install). `wrapTools` is a no-op when `SAMSARA_ENDPOINT` is unset,
+so it costs nothing in production and is safe to leave in permanently. Then check a trace in CI — it exits non-zero on a violation:
 
 ```bash
 samsara verify run.samsara.jsonl \
