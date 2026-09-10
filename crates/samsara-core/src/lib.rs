@@ -5,5 +5,6 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod canon;
 pub mod cas;
 pub mod hash;
