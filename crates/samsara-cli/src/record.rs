@@ -152,7 +152,7 @@ pub fn run(out: &Path, port: u16, command: &[String]) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -179,7 +179,10 @@ fn handle(
     Ok(())
 }
 
-fn json_response(status: u16, value: Value) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+pub(crate) fn json_response(
+    status: u16,
+    value: Value,
+) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     let body = serde_json::to_vec(&value).unwrap_or_default();
     tiny_http::Response::from_data(body)
         .with_status_code(status)

@@ -3,6 +3,7 @@
 mod bundle;
 mod demo;
 mod record;
+mod replay_cmd;
 mod ui;
 
 use std::path::PathBuf;
@@ -51,6 +52,42 @@ enum Command {
         /// Port for the local endpoint.
         #[arg(long, default_value_t = 8787)]
         port: u16,
+        /// The agent command, after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+
+    /// Replay a recorded trace back into a live agent process.
+    ///
+    /// Feeds the agent its recorded answers instead of calling the provider,
+    /// so nothing leaves the machine and nothing is spent. With `--strict`,
+    /// any behavioural change shows up as a located divergence. With
+    /// `--seed`, a fault schedule is injected and the run is checked for
+    /// violations, which makes a known failure into a regression test.
+    Replay {
+        /// The trace to replay.
+        trace: PathBuf,
+        /// Fail on any divergence, and inject no faults.
+        #[arg(long)]
+        strict: bool,
+        /// Inject the fault schedule this seed generates.
+        #[arg(long, conflicts_with = "strict")]
+        seed: Option<u64>,
+        /// Maximum faults in a generated schedule.
+        #[arg(long, default_value_t = 4)]
+        max_faults: usize,
+        /// Write the resulting branch here.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Port for the local endpoint.
+        #[arg(long, default_value_t = 8788)]
+        port: u16,
+        /// Tools whose effects must not happen twice. Defaults to every tool.
+        #[arg(long, value_delimiter = ',')]
+        effectful: Vec<String>,
+        /// Argument name carrying an idempotency key; such calls are exempt.
+        #[arg(long)]
+        idempotency_key: Option<String>,
         /// The agent command, after `--`.
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -123,6 +160,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match Cli::parse().command {
         Command::Demo { seeds, max_faults } => demo::run(seeds, max_faults),
         Command::Record { out, port, command } => record::run(&out, port, &command),
+        Command::Replay {
+            trace,
+            strict,
+            seed,
+            max_faults,
+            out,
+            port,
+            effectful,
+            idempotency_key,
+            command,
+        } => replay_cmd::run(
+            replay_cmd::Options {
+                trace,
+                out,
+                port,
+                seed,
+                max_faults,
+                strict,
+                effectful,
+                idempotency_key,
+            },
+            &command,
+        ),
         Command::Repro { seed, fixed } => demo::repro(seed, fixed),
         Command::Emit { out } => demo::emit(&out),
         Command::Show { trace, payloads } => show(&trace, payloads),
