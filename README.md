@@ -99,7 +99,7 @@ are here — is unreproducible.
 |---|---|
 | **Recording proxy** | `samsara record -- npm start` points the child's `ANTHROPIC_BASE_URL` at a local endpoint. **No TLS interception**: we are simply the configured base URL and make the upstream call ourselves, so there is no CA certificate to install. |
 | **Trace format** | JSONL — one header line, one line per effect — with payloads content-addressed by BLAKE3 into a sibling `.objects/` directory. Readable in a diff, because traces end up in pull requests as regression fixtures. |
-| **Tool shim** | ~100 lines of TypeScript. Contains no policy at all: it asks the engine what to do and does that, so a shim can never drift from the engine. |
+| **Tool shim** | ~150 lines of TypeScript. Contains no policy at all: it asks the engine what to do and does that, so a shim can never drift from the engine. It reports one thing the engine cannot observe — which calls were issued concurrently. |
 | **Replay engine** | Two modes. *Strict* asserts the agent asks exactly the same questions in the same order. *Counterfactual* replays to the fork point, injects a fault, then lets the agent run free. |
 
 ### The trick that makes offline counterfactuals work
@@ -209,7 +209,14 @@ $ samsara demo --scenario order
 **Testing order-dependence does not need threads, it needs control over
 order** — and real concurrency gives you the opposite. So `perform_batch` runs
 the calls one at a time and *chooses* the sequence, which is what a
-deterministic simulator does and why a finding reproduces from a seed. The
+deterministic simulator does and why a finding reproduces from a seed.
+
+Against a real agent the same thing happens over HTTP. The shim reports which
+calls it issued together — only the agent's own process can know that, since
+"concurrently in flight" and "back to back" are indistinguishable to a server
+— and on replay the proxy holds the batch at a barrier, sorts it into the
+order the recording used, applies the permutation, and hands the responses
+back one at a time. The
 model is faithful precisely where it matters: an agent that collects results
 and sorts them by index is unaffected by any permutation, and correctly so; an
 agent that folds each result into shared state as it lands is not.
@@ -259,11 +266,16 @@ Stated plainly, because a README that only lists strengths is not worth reading:
   — is out of reach.
 - **Streaming responses are recorded whole.** Chunk boundaries are not
   preserved, so mid-stream truncation faults are unavailable for model calls.
-- **The proxy does not yet group concurrent calls.** Order-dependence is
-  modelled in-process through `perform_batch`; over HTTP the proxy cannot yet
-  tell "concurrently in flight" from "back to back", so traces recorded from a
-  real agent carry no batches. Closing that needs a barrier in the tool
-  protocol, with the deadlock risk that implies.
+- **The batch barrier waits, bounded.** To reorder concurrent calls the proxy
+  must hold early arrivals until the rest of their burst appears — but a
+  counterfactual agent may have diverged and may never issue them. So the wait
+  expires after two seconds and schedules whatever turned up, with a warning.
+  The alternative is a tool that deadlocks on exactly the runs it exists to
+  investigate.
+- **Samsara guarantees the scheduled order, not the agent's.** Responses are
+  handed back one at a time, so a real agent observes results in the chosen
+  order. Once they are on the wire, the agent's own runtime decides what it
+  does with them; the trace records what Samsara scheduled.
 - **The oracle is content-addressed, not state-aware.** A stateful tool
   (`stat` before and after a write) returns its recorded answers in order and
   then holds the last one, which is right for retries and wrong for polling.
@@ -310,12 +322,12 @@ position stays well defined after the fork, and says what you actually mean:
 
 ```
 crates/samsara-core    engine: trace, CAS, canonicalisation, replay, faults,
-                       shrinking, invariants, batch scheduling  (67 tests)
+                       shrinking, invariants, batch scheduling  (68 tests)
 crates/samsara-cli     the `samsara` binary: record, replay, verify, and
                        end-to-end tests driving it against a stub provider
-                       (10 tests)
+                       (14 tests)
 crates/samsara-wasm    WebAssembly bindings for the timeline
-shim/typescript        the tool-side shim  (9 tests)
+shim/typescript        the tool-side shim  (12 tests)
 web/                   the browser timeline, and a contract test pinning
                        every JSON field the page reads  (7 tests)
 ```
