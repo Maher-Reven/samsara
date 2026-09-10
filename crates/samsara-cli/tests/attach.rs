@@ -10,6 +10,7 @@
 //! protocol exactly as a real one would. Nothing here is mocked except the
 //! provider itself, and no API key is needed.
 
+use samsara_core::prelude::{Fault, FaultSchedule};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -116,10 +117,14 @@ case "$DECISION" in
   *'"action":"execute"'*)
     # Recording: do the work, then report it. The side effect is a file, so
     # a test can assert on whether the world was really touched.
+    #
+    # `call` correlates this result with its begin; without it two concurrent
+    # calls would claim each other's outcomes.
+    CALL=$(printf '%s' "$DECISION" | sed -n 's/.*"call":"\([^"]*\)".*/\1/p')
     echo "deleted" >> "$SIDE_EFFECT_LOG"
     curl -sS -X POST "$SAMSARA_ENDPOINT/end" \
       -H 'content-type: application/json' \
-      -d '{"outcome":{"status":"ok","value":{"ok":true,"path":"/var/reports/stale.csv"}}}' \
+      -d "{\"call\":\"$CALL\",\"outcome\":{\"status\":\"ok\",\"value\":{\"ok\":true,\"path\":\"/var/reports/stale.csv\"}}}" \
       > /dev/null
     ;;
   *)
@@ -525,10 +530,11 @@ attempt() {
     *'"status":"err"'*) return 1 ;;
     *'"action":"return"'*) return 0 ;;
     *)
+      CALL=$(printf '%s' "$DECISION" | sed -n 's/.*"call":"\([^"]*\)".*/\1/p')
       echo "deleted" >> "$SIDE_EFFECT_LOG"
       curl -sS -X POST "$SAMSARA_ENDPOINT/end" \
         -H 'content-type: application/json' \
-        -d '{"outcome":{"status":"ok","value":{"ok":true}}}' > /dev/null
+        -d "{\"call\":\"$CALL\",\"outcome\":{\"status\":\"ok\",\"value\":{\"ok\":true}}}" > /dev/null
       return 0 ;;
   esac
 }
@@ -544,12 +550,40 @@ attempt || attempt
 
     // Now fault the tool call: the agent is told it failed and tries again,
     // against a call that had already taken effect.
+    //
+    // The seed is computed rather than hardcoded. A literal here silently
+    // stops testing anything the moment the generator's weights change --
+    // which is exactly what happened when reordering was added.
+    let parsed = read_trace(&trace);
+    let events = parsed["events"].as_array().unwrap();
+    let faultable: Vec<u64> = events
+        .iter()
+        .filter(|e| e["kind"] == "model" || e["kind"] == "tool")
+        .map(|e| e["seq"].as_u64().unwrap())
+        .collect();
+    let delete_seq = events
+        .iter()
+        .find(|e| e["name"] == "delete_file")
+        .and_then(|e| e["seq"].as_u64())
+        .expect("the recording deletes something");
+
+    let seed = (0..5000u64)
+        .find(|seed| {
+            // A fault that *masks* a call which really succeeded. Truncation
+            // and reordering do not make the agent retry.
+            matches!(
+                FaultSchedule::generate(*seed, &faultable, 4).at(delete_seq),
+                Some(Fault::Timeout) | Some(Fault::Error { .. })
+            )
+        })
+        .expect("some seed masks the delete");
+
     let (text, ok) = replay(
         &dir,
         &trace,
         &[
             "--seed",
-            "0",
+            &seed.to_string(),
             "--max-faults",
             "4",
             "--effectful",
@@ -584,5 +618,223 @@ fn replay_writes_a_branch_that_records_its_parent() {
         parsed["header"]["parent"].as_str().map(|s| s.len()),
         Some(64),
         "a branch must record the trace it forked from"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency over the wire
+// ---------------------------------------------------------------------------
+
+/// An agent that fires three tool calls at once and appends each result to a
+/// file as it lands — genuinely concurrent, three real processes racing.
+///
+/// It reports a batch id the way the shim does, because only the agent's own
+/// process can know which calls it issued together.
+const CONCURRENT_AGENT: &str = r#"
+curl -sS -X POST "$ANTHROPIC_BASE_URL/v1/messages" \
+  -H 'content-type: application/json' \
+  -d '{"model":"claude-sonnet-4","messages":[{"role":"user","content":"assemble"}]}' \
+  > /dev/null
+
+section() {
+  DECISION=$(curl -sS -X POST "$SAMSARA_ENDPOINT/begin" \
+    -H 'content-type: application/json' \
+    -d "{\"name\":\"render_section\",\"body\":{\"name\":\"$1\"},\"batch\":1}")
+  case "$DECISION" in
+    *'"action":"return"'*)
+      # Replay: record the order the engine released us in.
+      echo "$1" >> "$SIDE_EFFECT_LOG" ;;
+    *)
+      CALL=$(printf '%s' "$DECISION" | sed -n 's/.*"call":"\([^"]*\)".*/\1/p')
+      echo "$1" >> "$SIDE_EFFECT_LOG"
+      curl -sS -X POST "$SAMSARA_ENDPOINT/end" \
+        -H 'content-type: application/json' \
+        -d "{\"call\":\"$CALL\",\"outcome\":{\"status\":\"ok\",\"value\":{\"text\":\"<$1>\"}}}" \
+        > /dev/null ;;
+  esac
+}
+
+section intro &
+section summary &
+section appendix &
+wait
+"#;
+
+#[test]
+fn the_proxy_groups_genuinely_concurrent_calls_into_a_batch() {
+    let dir = scratch("concurrent-record");
+    let upstream = Upstream::start();
+    let trace_path = record(&dir, &upstream, CONCURRENT_AGENT);
+
+    let trace = read_trace(&trace_path);
+    let events = trace["events"].as_array().unwrap();
+
+    let batched: Vec<&serde_json::Value> =
+        events.iter().filter(|e| e.get("batch").is_some()).collect();
+    assert_eq!(batched.len(), 3, "three calls raced: {events:#?}");
+    assert!(
+        batched.iter().all(|e| e["batch"] == batched[0]["batch"]),
+        "and they share one batch id"
+    );
+
+    // The model call came first and alone, so it must not be batched.
+    let model = events.iter().find(|e| e["kind"] == "model").unwrap();
+    assert!(model.get("batch").is_none(), "a lone call is not a batch");
+}
+
+#[test]
+fn a_lone_tool_call_is_not_recorded_as_a_batch() {
+    // The shim assigns an id to every call because it cannot know at begin
+    // time whether anything will join. Singletons must be cleared, or every
+    // sequential trace would claim a concurrency that never happened.
+    let dir = scratch("lone-call");
+    let upstream = Upstream::start();
+    let agent = AGENT.replace(
+        r#"-d '{"name":"delete_file","body":{"path":"/var/reports/stale.csv"}}'"#,
+        r#"-d '{"name":"delete_file","body":{"path":"/var/reports/stale.csv"},"batch":1}'"#,
+    );
+    let trace_path = record(&dir, &upstream, &agent);
+
+    let trace = read_trace(&trace_path);
+    assert!(
+        trace["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e.get("batch").is_none()),
+        "no batch survived: {:#?}",
+        trace["events"]
+    );
+}
+
+#[test]
+fn replay_holds_concurrent_calls_and_releases_them_in_a_chosen_order() {
+    let dir = scratch("concurrent-replay");
+    let upstream = Upstream::start();
+    let trace_path = record(&dir, &upstream, CONCURRENT_AGENT);
+
+    // Assert on the *branch trace*, not on the agent's log.
+    //
+    // The branch is what Samsara guarantees and what every downstream
+    // analysis reads. The order three separate shell processes manage to
+    // append to a file after their responses land is their business, not
+    // ours — responses are handed out one at a time so a real agent observes
+    // the chosen order, but a race between OS processes after that point is
+    // outside anything a proxy can promise.
+    let order_for = |seed: u64| -> Vec<String> {
+        let branch = dir.join(format!("branch-{seed}.samsara.jsonl"));
+        let (text, _) = replay(
+            &dir,
+            &trace_path,
+            &[
+                "--seed",
+                &seed.to_string(),
+                "--max-faults",
+                "2",
+                "--out",
+                branch.to_str().unwrap(),
+            ],
+            CONCURRENT_AGENT,
+        );
+        assert!(
+            !text.contains("timed out"),
+            "the barrier must assemble the batch, not time out:\n{text}"
+        );
+
+        let parsed = read_trace(&branch);
+        let order: Vec<String> = parsed["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["name"] == "render_section")
+            .map(|e| e["identity"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(order.len(), 3, "all three were scheduled:\n{text}");
+        order
+    };
+
+    let first = order_for(3);
+    for attempt in 0..3 {
+        assert_eq!(
+            order_for(3),
+            first,
+            "seed 3 must schedule the batch identically every run (attempt {attempt})"
+        );
+    }
+
+    // And the schedule genuinely controls it: a seed that puts a scheduling
+    // fault on the batch must change the order the batch is performed in.
+    //
+    // The seed is computed rather than guessed. Reordering is one fault kind
+    // among seven and has to land on one exact position, so scanning a
+    // handful of seeds and hoping is a flaky test; asking the generator
+    // which seeds qualify is not.
+    let recorded = read_trace(&trace_path);
+    let events = recorded["events"].as_array().unwrap();
+
+    let faultable: Vec<u64> = events
+        .iter()
+        .filter(|e| e["kind"] == "model" || e["kind"] == "tool")
+        .map(|e| e["seq"].as_u64().unwrap())
+        .collect();
+    let batch_start = events
+        .iter()
+        .find(|e| e.get("batch").is_some())
+        .and_then(|e| e["seq"].as_u64())
+        .expect("the recording has a batch");
+
+    let seed = (0..5000u64)
+        .find(|seed| {
+            FaultSchedule::generate(*seed, &faultable, 2)
+                .at(batch_start)
+                .is_some_and(Fault::is_scheduling)
+        })
+        .expect("some seed schedules a reordering of the batch");
+
+    let recorded_order: Vec<String> = events
+        .iter()
+        .filter(|e| e["name"] == "render_section")
+        .map(|e| e["identity"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(recorded_order.len(), 3);
+
+    assert_ne!(
+        order_for(seed),
+        recorded_order,
+        "seed {seed} places a reordering on the batch and must change its order"
+    );
+}
+
+#[test]
+fn the_barrier_gives_up_rather_than_hanging() {
+    // The one place Samsara can hang. A counterfactual agent may diverge and
+    // never issue the calls the barrier is waiting for, so the wait is
+    // bounded and the run completes with a warning instead of wedging.
+    let dir = scratch("barrier-timeout");
+    let upstream = Upstream::start();
+    let trace_path = record(&dir, &upstream, CONCURRENT_AGENT);
+
+    // An agent that issues only one of the three calls the recording holds.
+    let short = r#"
+curl -sS -X POST "$ANTHROPIC_BASE_URL/v1/messages" \
+  -H 'content-type: application/json' \
+  -d '{"model":"claude-sonnet-4","messages":[{"role":"user","content":"assemble"}]}' \
+  > /dev/null
+curl -sS -X POST "$SAMSARA_ENDPOINT/begin" \
+  -H 'content-type: application/json' \
+  -d '{"name":"render_section","body":{"name":"intro"},"batch":1}' > /dev/null
+"#;
+
+    let started = std::time::Instant::now();
+    let (text, _) = replay(&dir, &trace_path, &[], short);
+    let elapsed = started.elapsed();
+
+    assert!(
+        text.contains("timed out"),
+        "the barrier must report giving up:\n{text}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "it must actually give up, took {elapsed:?}"
     );
 }
