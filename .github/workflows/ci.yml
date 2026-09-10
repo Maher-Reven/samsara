@@ -1,0 +1,73 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --features testkit -- -D warnings
+
+      # The whole suite runs without a network or an API key. That is a
+      # design constraint, not a happy accident: a test suite that needs
+      # credentials is a test suite that stops being run.
+      - name: Test
+        run: cargo test --features testkit
+
+      # The worked example is executable documentation. If the README's
+      # output stops being true, the build should notice.
+      - name: Demo
+        run: cargo run --bin samsara -- demo
+
+      # `verify` exits non-zero on a violation, which is how it is meant to
+      # be used in a real pipeline. Here we assert it does exactly that.
+      - name: Verify detects the known-bad trace
+        run: |
+          cargo run --bin samsara -- emit
+          cargo run --bin samsara -- verify traces/clean.samsara.jsonl \
+            --effectful delete_file
+          if cargo run --bin samsara -- verify traces/counterfactual.samsara.jsonl \
+               --effectful delete_file; then
+            echo "::error::verify passed a trace containing a duplicate side effect"
+            exit 1
+          fi
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the browser engine
+        run: cargo build -p samsara-wasm --target wasm32-unknown-unknown --release
+
+  shim:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: shim/typescript
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+      - run: npx tsc --noEmit -p tsconfig.json
