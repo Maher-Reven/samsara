@@ -4,6 +4,7 @@ mod bundle;
 mod demo;
 mod record;
 mod replay_cmd;
+mod sweep_cmd;
 mod ui;
 
 use std::path::PathBuf;
@@ -33,6 +34,17 @@ enum Scenario {
     /// Concurrent tool calls complete in a different order, and the agent
     /// quietly produces the wrong result.
     Order,
+}
+
+/// Which worked example `sweep` runs against.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum SweepSubject {
+    /// The retrying agent, with its duplicate-delete bug.
+    Retry,
+    /// The assembling agent, with its order dependence.
+    Order,
+    /// The fixed agent, which should survive everything.
+    Fixed,
 }
 
 #[derive(Subcommand, Debug)]
@@ -126,6 +138,31 @@ enum Command {
         out: PathBuf,
     },
 
+    /// Check every fault and every ordering, then say what was covered.
+    ///
+    /// Random injection can tell you a bug exists. This tells you when
+    /// there are no more to find, within stated bounds, and writes those
+    /// bounds to a certificate you can commit and re-check in CI.
+    Sweep {
+        /// Which worked example to sweep.
+        #[arg(long, value_enum, default_value_t = SweepSubject::Retry)]
+        subject: SweepSubject,
+        /// Also check every pair of faults, not only every single one.
+        #[arg(long)]
+        pairs: bool,
+        /// Cap on replays. Reaching it forfeits the completeness claim,
+        /// which the certificate records.
+        #[arg(long, default_value_t = 100_000)]
+        max_replays: usize,
+        /// Write the certificate here.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Compare against a committed certificate and exit non-zero on any
+        /// difference, including coverage that shrank.
+        #[arg(long)]
+        check: Option<PathBuf>,
+    },
+
     /// Print a recorded trace.
     Show {
         /// Path to a `.samsara.jsonl` trace.
@@ -202,6 +239,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 idempotency_key,
             },
             &command,
+        ),
+        Command::Sweep {
+            subject,
+            pairs,
+            max_replays,
+            out,
+            check,
+        } => sweep_cmd::run(
+            match subject {
+                SweepSubject::Retry => sweep_cmd::Subject::Retry,
+                SweepSubject::Order => sweep_cmd::Subject::Order,
+                SweepSubject::Fixed => sweep_cmd::Subject::Fixed,
+            },
+            pairs,
+            max_replays,
+            out,
+            check,
         ),
         Command::Repro { seed, fixed } => demo::repro(seed, fixed),
         Command::Emit { out } => demo::emit(&out),

@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "engine": "samsara/0.1.0",
+  "trace": "0cdd706f7e86dc40942b80151c92832aa7612e771ffe3f3c31d277a34a5377d5",
+  "label": "assemble-report",
+  "invariants": [
+    "no_duplicate_effects",
+    "terminates_within"
+  ],
+  "coverage": {
+    "positions": 5,
+    "kinds": 5,
+    "singles_checked": 25,
+    "singles_exhaustive": true,
+    "pairs_checked": 0,
+    "pairs_exhaustive": false,
+    "replays": 25,
+    "failures": []
+  },
+  "interleavings": [
+    {
+      "batch": 0,
+      "width": 3,
+      "total": 6,
+      "checked": 6,
+      "exhaustive": true,
+      "commuting_pairs": 0,
+      "adjacent_pairs": 2,
+      "divergent": [
+        [
+          0,
+          2,
+          1
+        ],
+        [
+          1,
+          0,
+          2
+        ],
+        [
+          1,
+          2,
+          0
+        ],
+        [
+          2,
+          0,
+          1
+        ],
+        [
+          2,
+          1,
+          0
+        ]
+      ],
+      "replays": 7
+    }
+  ],
+  "verdict": "broken",
+  "claims": [
+    "no single fault breaks this agent — all 25 were checked",
+    "batch #0 behaves differently under 5 of all 6 orderings"
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "engine": "samsara/0.1.0",
+  "trace": "7b8062d5cc3002aa136f1df6f330090f9179cfdc1a02b77d1849fb58c0526a8b",
+  "label": "delete-stale-report",
+  "invariants": [
+    "no_duplicate_effects",
+    "terminates_within"
+  ],
+  "coverage": {
+    "positions": 3,
+    "kinds": 5,
+    "singles_checked": 15,
+    "singles_exhaustive": true,
+    "pairs_checked": 75,
+    "pairs_exhaustive": true,
+    "replays": 90,
+    "failures": []
+  },
+  "interleavings": [],
+  "verdict": "clean",
+  "claims": [
+    "no single fault breaks this agent — all 15 were checked; no pair does either, across all 75"
+  ]
+}
