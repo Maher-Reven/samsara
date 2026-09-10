@@ -8,6 +8,7 @@
 pub mod canon;
 pub mod cas;
 pub mod event;
+pub mod explore;
 pub mod fault;
 pub mod hash;
 pub mod invariant;
@@ -20,6 +21,7 @@ pub mod prelude {
     pub use crate::canon::Canonicalizer;
     pub use crate::cas::{Cas, FsCas, MemCas};
     pub use crate::event::{EffectKind, EffectRequest, Event, Outcome};
+    pub use crate::explore::{evaluate, minimise, search, Finding};
     pub use crate::fault::{Fault, FaultPoint, FaultSchedule};
     pub use crate::hash::Digest;
     pub use crate::invariant::{
