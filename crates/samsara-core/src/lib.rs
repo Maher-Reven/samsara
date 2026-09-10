@@ -12,6 +12,7 @@ pub mod fault;
 pub mod hash;
 pub mod invariant;
 pub mod replay;
+pub mod shrink;
 pub mod trace;
 
 /// The types you need to use Samsara, in one import.
@@ -27,5 +28,6 @@ pub mod prelude {
     pub use crate::replay::{
         Backend, Divergence, DivergenceKind, Effects, Mode, Recorder, ReplayResult, Replayer,
     };
+    pub use crate::shrink::{shrink, Shrunk};
     pub use crate::trace::{Trace, TraceHeader};
 }
