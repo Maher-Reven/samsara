@@ -41,6 +41,13 @@ pub enum Fault {
     /// The result is correct but arrives `ms` later, which can matter when
     /// the agent races it against a deadline.
     Delay { ms: u64 },
+    /// Concurrent calls complete in exactly this order.
+    ///
+    /// `Reorder` picks a permutation from a seed, which is what random
+    /// search wants. Exhaustive checking needs the opposite: to *name* the
+    /// ordering, so a report can say which one broke things and a certificate
+    /// can record precisely what was covered.
+    Exact { order: Vec<usize> },
     /// Concurrent calls complete in a different order.
     ///
     /// Unlike every other variant this does not perturb an outcome at all —
@@ -62,7 +69,32 @@ impl Fault {
             Fault::Malformed => "malformed".into(),
             Fault::Delay { ms } => format!("delay({ms}ms)"),
             Fault::Reorder { .. } => "reorder".into(),
+            Fault::Exact { order } => format!("order{order:?}"),
         }
+    }
+
+    /// One representative of every way an outcome can be perturbed.
+    ///
+    /// This is what makes exhaustive coverage possible. The fault space is
+    /// nominally infinite -- `Truncate` alone has a parameter -- so a sweep
+    /// that enumerated it would never finish. Collapsing each family to a
+    /// single worst case makes the space finite and therefore *completable*,
+    /// which is the difference between "we tried five hundred seeds" and
+    /// "there is no single fault that breaks this".
+    ///
+    /// The representatives are chosen to be maximally destructive, since a
+    /// system that survives `Truncate { keep: 0 }` survives every larger
+    /// keep. `Delay` is excluded because it does not alter an outcome, and
+    /// `Reorder` because it is a scheduling decision covered by interleaving
+    /// exploration rather than by fault injection.
+    pub fn canonical_set() -> Vec<Fault> {
+        vec![
+            Fault::Timeout,
+            Fault::Error { code: "503".into() },
+            Fault::Truncate { keep: 0 },
+            Fault::Duplicate,
+            Fault::Malformed,
+        ]
     }
 
     /// Whether this fault perturbs *when* an effect completes rather than
@@ -73,7 +105,7 @@ impl Fault {
     /// because nothing was suppressed and the duplicate-effect check would
     /// then hedge about a call that plainly succeeded.
     pub fn is_scheduling(&self) -> bool {
-        matches!(self, Fault::Reorder { .. })
+        matches!(self, Fault::Reorder { .. } | Fault::Exact { .. })
     }
 
     /// A permutation of `n` items derived from this fault's seed.
@@ -82,6 +114,17 @@ impl Fault {
     /// Returns `None` for a non-scheduling fault or a batch too small to
     /// reorder.
     pub fn permutation(&self, n: usize) -> Option<Vec<usize>> {
+        if let Fault::Exact { order } = self {
+            // A named ordering is used verbatim -- but only after checking
+            // it really is a permutation of this width. A malformed one
+            // would index out of bounds in the scheduler, and silently
+            // returning None for a *valid* one is worse still: the caller
+            // then reports "checked every ordering" having reordered
+            // nothing at all.
+            let mut sorted = order.clone();
+            sorted.sort_unstable();
+            return (sorted == (0..n).collect::<Vec<_>>()).then(|| order.clone());
+        }
         let Fault::Reorder { seed } = self else {
             return None;
         };
@@ -114,7 +157,10 @@ impl Fault {
                 Outcome::err(code.clone(), format!("samsara: injected error {code}"))
             }
             // Reordering changes when a result arrives, never what it says.
-            Fault::Reorder { .. } | Fault::Delay { .. } | Fault::Duplicate => observed.clone(),
+            Fault::Reorder { .. }
+            | Fault::Exact { .. }
+            | Fault::Delay { .. }
+            | Fault::Duplicate => observed.clone(),
             Fault::Malformed => Outcome::Ok {
                 value: Value::String("{\"truncated\": tru".into()),
             },
@@ -323,6 +369,9 @@ mod tests {
                     Fault::Malformed => "malformed",
                     Fault::Delay { .. } => "delay",
                     Fault::Reorder { .. } => "reorder",
+                    // Never generated at random: exhaustive checking names
+                    // the ordering it wants rather than drawing one.
+                    Fault::Exact { .. } => "exact",
                 });
             }
         }
@@ -337,6 +386,11 @@ mod tests {
         ] {
             assert!(kinds.contains(kind), "generator never produced {kind}");
         }
+        assert!(
+            !kinds.contains("exact"),
+            "`Exact` names an ordering and belongs to exhaustive checking, \
+             not to random search"
+        );
     }
 
     #[test]
