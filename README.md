@@ -59,6 +59,7 @@ $ samsara demo          # no API key, no network, no cost
 <!-- toc -->
 
 **Using it:** [Who this is for](#who-this-is-for) ·
+[How it evaluates](#how-it-evaluates) ·
 [Install](#install) ·
 [API docs](https://maher-reven.github.io/samsara/docs/) ·
 [Your first sweep](#your-first-sweep) ·
@@ -90,6 +91,34 @@ problem and [Braintrust][braintrust], [Langfuse][langfuse] and others do it
 properly. Samsara says nothing about whether your agent gave a good answer. It
 only says whether it can be made to do something it must never do.
 
+### How it evaluates
+
+Not by scoring. The method is three things, and they only work together:
+
+**Deterministic replay** turns one recorded run into a fixture you can run a
+thousand times for free. **Fault injection** perturbs that fixture in every
+way it can be perturbed. **Declared invariants** decide whether the result is
+acceptable. Take any one away and the other two are useless: replay without
+faults only reproduces what already happened, faults without invariants only
+find crashes, and invariants without deterministic replay produce findings
+that do not reproduce.
+
+That is verification rather than statistics, and the difference shows up in
+what you get back:
+
+| | Scoring ("LLM evals") | Verification (this) |
+|---|---|---|
+| Input | A dataset of cases | One recorded run |
+| Method | Run, judge, aggregate | Replay, perturb, assert |
+| Judge | An LLM, or a metric | Invariants over the effect trace |
+| Result | "82% on this set" | "no single fault breaks this" |
+| Rerun | A different number | Identical, byte for byte |
+| A failure is | A score that dropped | A named schedule, minimised to one fault |
+
+**Samsara does not evaluate what your agent said. It evaluates what your agent
+did, under conditions you choose.** Those are different axes, and a serious
+agent wants both.
+
 ### What you need
 
 | | |
@@ -110,7 +139,8 @@ system clock outside a wrapped call has non-determinism Samsara cannot replay
 or perturb. In practice that means wrapping the tools that matter and using
 `now()` / `random()` in your retry logic — not a rewrite, but not nothing.
 
-**Samsara is not an eval harness.** Evals ask whether the answer was good;
+**Samsara is not an eval harness** in the scoring sense — see
+[How it evaluates](#how-it-evaluates). Evals ask whether the answer was good;
 this asks whether the agent can be made to do something it must never do.
 Different axis, and you probably want both.
 
