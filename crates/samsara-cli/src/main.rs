@@ -2,6 +2,7 @@
 
 mod bundle;
 mod demo;
+mod record;
 mod ui;
 
 use std::path::PathBuf;
@@ -36,6 +37,23 @@ enum Command {
         /// Maximum faults per generated schedule.
         #[arg(long, default_value_t = 4)]
         max_faults: usize,
+    },
+
+    /// Record an agent run by proxying its model calls.
+    ///
+    /// Starts a local endpoint, points the child process at it, and writes a
+    /// trace when the child exits. No TLS interception and no certificate to
+    /// install — Samsara is simply the configured base URL.
+    Record {
+        /// Where to write the trace.
+        #[arg(short, long, default_value = "run.samsara.jsonl")]
+        out: PathBuf,
+        /// Port for the local endpoint.
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+        /// The agent command, after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
     },
 
     /// Reproduce a known failure from its seed.
@@ -104,6 +122,7 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     match Cli::parse().command {
         Command::Demo { seeds, max_faults } => demo::run(seeds, max_faults),
+        Command::Record { out, port, command } => record::run(&out, port, &command),
         Command::Repro { seed, fixed } => demo::repro(seed, fixed),
         Command::Emit { out } => demo::emit(&out),
         Command::Show { trace, payloads } => show(&trace, payloads),
