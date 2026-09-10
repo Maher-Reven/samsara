@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/samsara-core"]
+members = ["crates/samsara-core", "crates/samsara-cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -22,4 +22,5 @@ thiserror = "1"
 # also what lets the engine compile to wasm32-unknown-unknown at all.
 rand = { version = "0.8", default-features = false }
 rand_chacha = "0.3"
+clap = { version = "4", features = ["derive"] }
 
