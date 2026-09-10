@@ -27,6 +27,9 @@ jobs:
       # The whole suite runs without a network or an API key. That is a
       # design constraint, not a happy accident: a test suite that needs
       # credentials is a test suite that stops being run.
+      #
+      # This includes the end-to-end attach tests, which drive the real
+      # binary against a stub provider over real HTTP.
       - name: Test
         run: cargo test --features testkit
 
@@ -71,3 +74,6 @@ jobs:
           node-version: 20
       - run: npm install
       - run: npx tsc --noEmit -p tsconfig.json
+      # Covers the replay branch, which the recording proxy cannot yet
+      # exercise end to end — see "What it does not do yet".
+      - run: npm test

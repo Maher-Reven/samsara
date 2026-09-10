@@ -172,6 +172,11 @@ samsara verify run.samsara.jsonl \
 
 Stated plainly, because a README that only lists strengths is not worth reading:
 
+- **Replay is not yet wired through the proxy.** `samsara record` captures a
+  real agent; replaying that trace back into a live agent process is not
+  implemented. The shim already speaks the replay half of the protocol and is
+  tested against it, but the proxy never emits it, so today's replay is
+  in-process only. This is the next thing I would build.
 - **Streaming responses are recorded whole.** Chunk boundaries are not
   preserved, so mid-stream truncation faults are unavailable for model calls.
 - **Parallel tool calls are not scheduled.** Effects are a linear sequence;
@@ -187,7 +192,7 @@ Stated plainly, because a README that only lists strengths is not worth reading:
 
 ## Notes from the build
 
-Three bugs the test suite found that I would not have found by reading:
+Four bugs the test suite found that I would not have found by reading:
 
 **Floats do not survive a round trip.** The metamorphic property failed with no
 divergences and no holes — replay was behaviourally perfect but its trace
@@ -203,6 +208,13 @@ sharing a digest — both have empty bodies. The same collision means
 and since the oracle answers by identity, it would silently serve one effect's
 response to a completely different effect. Identity is now over kind, name,
 *and* arguments.
+
+**A test that matches its own fixture is not a test.** The first end-to-end
+test asserted that `samsara show` output contained `delete_file`, and it
+passed with tool recording ripped out of the proxy — because `show` prints the
+trace label, the label is the agent command, and the command string contains
+`delete_file`. Mutation testing caught it; nothing else would have. The tests
+now assert against event rows only.
 
 **Faults must be keyed to the branch, not the recording.** Keying them to
 recorded position seems natural and is wrong: the first injected fault knocks
