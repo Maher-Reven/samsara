@@ -87,14 +87,19 @@ Concretely, Samsara is worth your time if:
 - At least one of your tools is not safe to run twice.
 - You have ever seen a bug you could not reproduce.
 
-**It is not for you if** you are measuring answer quality — that is an evals
-problem and [Braintrust][braintrust], [Langfuse][langfuse] and others do it
-properly. Samsara says nothing about whether your agent gave a good answer. It
-only says whether it can be made to do something it must never do.
+**It is not for you if** you are measuring answer quality — that is what
+[Braintrust][braintrust], [Langfuse][langfuse] and promptfoo do, and they do
+it properly. Samsara says nothing about whether your agent gave a good answer.
+It says whether it can be made to do something it must never do.
 
 ### How it evaluates
 
-Not by scoring. The method is three things, and they only work together:
+Samsara is an eval harness — for **behaviour**, not for output. It subjects
+your agent to conditions and returns a verdict, which is what evaluation is.
+What it does not do is score answer quality, and every tool that calls itself
+an "LLM eval" does exactly that. Same word, different subject.
+
+The method is three things, and they only work together:
 
 **Deterministic replay** turns one recorded run into a fixture you can run a
 thousand times for free. **Fault injection** perturbs that fixture in every
@@ -119,6 +124,18 @@ what you get back:
 **Samsara does not evaluate what your agent said. It evaluates what your agent
 did, under conditions you choose.** Those are different axes, and a serious
 agent wants both.
+
+Three properties separate this from a scoring eval, and they are the reason
+the output is committable:
+
+- **The verdict is deterministic.** Rerun a scoring eval and the number
+  moves, so you manage it with thresholds. Rerun this and you get identical
+  bytes.
+- **The coverage is exhaustive, not sampled.** An eval tells you about the
+  cases in your dataset. This tells you there are no more cases — the fault
+  space is finite and all of it ran.
+- **A failure is a reproducer**, not a metric that dropped: a named schedule,
+  minimised to the one fault that matters.
 
 To be unambiguous about one thing: Samsara does not check your evals, run
 them, or know they exist. Both tools point at the agent, from different
@@ -146,10 +163,10 @@ system clock outside a wrapped call has non-determinism Samsara cannot replay
 or perturb. In practice that means wrapping the tools that matter and using
 `now()` / `random()` in your retry logic — not a rewrite, but not nothing.
 
-**Samsara is not an eval harness** in the scoring sense — see
-[How it evaluates](#how-it-evaluates). Evals ask whether the answer was good;
-this asks whether the agent can be made to do something it must never do.
-Different axis, and you probably want both.
+**Samsara evaluates behaviour, not answers** — see
+[How it evaluates](#how-it-evaluates). Scoring evals ask whether the answer
+was good; this asks whether the agent can be made to do something it must
+never do. Different axis, and you probably want both.
 
 Model calls work with any language today. **Tool calls need a shim, and only
 TypeScript has one** — a Python port is an afternoon, because the shim carries
