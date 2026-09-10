@@ -171,15 +171,42 @@ samsara verify run.samsara.jsonl \
   --idempotency-key idempotency_key
 ```
 
+## Replaying it
+
+Feed a recorded trace back into your real agent process. Nothing leaves the
+machine and nothing is spent, because every answer comes from the recording.
+
+**Did I change anything?**
+
+```bash
+samsara replay run.samsara.jsonl --strict -- npm start
+```
+
+Strict replay asserts the agent asks the same questions in the same order.
+Edit a prompt, reorder a tool list, bump an SDK, then run this: a behavioural
+change becomes a located divergence naming the field that moved, rather than a
+vague sense that something is different. Exits non-zero if anything diverged.
+
+**Does it survive adversity?**
+
+```bash
+samsara replay run.samsara.jsonl --seed 91238 \
+  --effectful delete_file -- npm start
+```
+
+Injects the fault schedule that seed generates and checks the resulting run
+for violations. During replay the shim never executes the real tool, so
+reproducing a delete-twice bug does not delete anything twice. Add the seed to
+CI and the build goes red if the bug comes back.
+
 ## What it does not do yet
 
 Stated plainly, because a README that only lists strengths is not worth reading:
 
-- **Replay is not yet wired through the proxy.** `samsara record` captures a
-  real agent; replaying that trace back into a live agent process is not
-  implemented. The shim already speaks the replay half of the protocol and is
-  tested against it, but the proxy never emits it, so today's replay is
-  in-process only. This is the next thing I would build.
+- **An injected timeout surfaces as an error, not as latency.** Replay answers
+  immediately with the error rather than making the caller wait, so a bug that
+  depends on wall-clock deadline handling — rather than on the failure itself
+  — is out of reach.
 - **Streaming responses are recorded whole.** Chunk boundaries are not
   preserved, so mid-stream truncation faults are unavailable for model calls.
 - **Parallel tool calls are not scheduled.** Effects are a linear sequence;
@@ -232,8 +259,9 @@ position stays well defined after the fork, and says what you actually mean:
 ```
 crates/samsara-core    engine: trace, CAS, canonicalisation, replay, faults,
                        shrinking, invariants  (59 tests)
-crates/samsara-cli     the `samsara` binary, and end-to-end tests that drive
-                       it against a stub provider  (6 tests)
+crates/samsara-cli     the `samsara` binary: record, replay, verify, and
+                       end-to-end tests driving it against a stub provider
+                       (10 tests)
 crates/samsara-wasm    WebAssembly bindings for the timeline
 shim/typescript        the tool-side shim  (9 tests)
 web/                   the browser timeline, and a contract test pinning
