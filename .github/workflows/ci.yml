@@ -53,6 +53,32 @@ jobs:
             exit 1
           fi
 
+  # A declared MSRV nobody builds is a guess. This reads the version out of
+  # Cargo.toml and compiles on exactly that toolchain, so the claim cannot
+  # drift -- it was wrong by seven releases until this job existed.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: msrv
+        run: |
+          lib=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          cli=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' crates/samsara-cli/Cargo.toml | head -1)
+          echo "lib=$lib" >> "$GITHUB_OUTPUT"
+          echo "cli=$cli" >> "$GITHUB_OUTPUT"
+          echo "engine MSRV $lib, cli MSRV $cli"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.lib }}
+      - uses: Swatinem/rust-cache@v2
+      # The engine is the part anyone would depend on, so its floor is the
+      # one that matters.
+      - run: cargo +${{ steps.msrv.outputs.lib }} check -p samsara-core --all-targets --features testkit
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.cli }}
+      - run: cargo +${{ steps.msrv.outputs.cli }} check --all-targets --features testkit
+
   wasm:
     runs-on: ubuntu-latest
     env:

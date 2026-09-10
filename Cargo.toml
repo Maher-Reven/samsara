@@ -6,8 +6,12 @@ members = ["crates/samsara-core", "crates/samsara-cli", "crates/samsara-wasm"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/maherkurdi/samsara"
-rust-version = "1.75"
+repository = "https://github.com/Maher-Reven/samsara"
+# The engine's floor, verified rather than guessed: `blake3` pulls
+# `constant_time_eq`, which is edition2024, which is 1.85. CI compiles on
+# exactly this toolchain, because a declared MSRV nobody builds is a guess --
+# this one was wrong by ten releases until the job existed.
+rust-version = "1.85"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

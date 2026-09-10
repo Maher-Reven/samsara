@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
+keywords = ["llm", "agents", "testing", "replay", "determinism"]
+categories = ["development-tools::testing", "simulation"]
 
 [features]
 # Exposes the deterministic fake world and the agent under test, so other

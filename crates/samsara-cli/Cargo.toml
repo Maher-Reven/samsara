@@ -5,6 +5,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# Higher than the workspace: `ureq` reaches `idna` reaches `icu`, which
+# requires 1.88. The engine deliberately does not depend on any of that, so a
+# project embedding `samsara-core` is not dragged along.
+rust-version = "1.88"
+keywords = ["llm", "agents", "testing", "replay", "cli"]
+categories = ["development-tools::testing", "command-line-utilities"]
 
 [[bin]]
 name = "samsara"
