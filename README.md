@@ -60,6 +60,7 @@ $ samsara demo          # no API key, no network, no cost
 
 **Using it:** [Who this is for](#who-this-is-for) ·
 [How it evaluates](#how-it-evaluates) ·
+[Providers](#which-providers) ·
 [Install](#install) ·
 [API docs](https://maher-reven.github.io/samsara/docs/) ·
 [Your first sweep](#your-first-sweep) ·
@@ -156,9 +157,25 @@ no logic, but it does not exist yet. Without a shim you still get model-call
 replay and divergence detection; you do not get tool fault injection, which is
 where most of the value is.
 
-Request shapes are tuned for Anthropic. OpenAI-style requests record and
-replay, but the canonicaliser's default volatile-path list has not been
-checked against them.
+### Which providers
+
+| | |
+|---|---|
+| **Anthropic** | works, and is what the canonicaliser's volatile-path defaults are tuned for |
+| **OpenAI** | works. Routing is by request path, so `/v1/chat/completions` reaches OpenAI and `/v1/messages` reaches Anthropic, from the same proxy |
+| **Gemini, Vertex, Bedrock** | **not intercepted.** Their SDKs do not read `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL`, so the proxy never sees the call |
+| **Anything else** | set `SAMSARA_UPSTREAM` to point the proxy at it — a gateway, a router, a self-hosted model |
+
+Gemini specifically: if you reach it through its OpenAI-compatible endpoint
+with an OpenAI client, it is intercepted like any other OpenAI call. Through
+the native Google SDK it is not, and adding that means a base-URL override the
+SDK actually honours. The engine does not care either way — a model response
+is opaque bytes to it — so this is proxy plumbing, not a design limit.
+
+The canonicaliser's default volatile-path list is tuned for Anthropic's
+request shape. OpenAI records and replays, but if you see spurious
+divergences on fields your SDK regenerates per request, add them to the
+volatile list.
 
 [braintrust]: https://braintrust.dev
 [langfuse]: https://langfuse.com

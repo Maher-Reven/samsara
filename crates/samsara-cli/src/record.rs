@@ -224,6 +224,34 @@ pub(crate) fn json_response(
         )
 }
 
+/// Where to forward a request, chosen by its path.
+///
+/// The proxy is a single endpoint standing in for every provider at once,
+/// because the child is handed `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL`
+/// pointing at the same port. That means the forwarding target cannot be a
+/// constant, and until this existed it was one: an OpenAI agent's
+/// `/v1/chat/completions` was posted to `api.anthropic.com`, which fails in
+/// a way that looks like the agent's fault.
+///
+/// Paths are unambiguous between the two providers, so they are what decides.
+/// `SAMSARA_UPSTREAM` still overrides everything, which is what the tests use
+/// to point at a stub.
+pub(crate) fn upstream_for(path: &str) -> String {
+    if let Ok(explicit) = std::env::var("SAMSARA_UPSTREAM") {
+        return explicit;
+    }
+    // Anthropic: /v1/messages, /v1/complete.
+    // OpenAI:    /v1/chat/completions, /v1/responses, /v1/embeddings, ...
+    if path.starts_with("/v1/chat/")
+        || path.starts_with("/v1/responses")
+        || path.starts_with("/v1/embeddings")
+        || path.starts_with("/v1/completions")
+    {
+        return "https://api.openai.com".to_string();
+    }
+    "https://api.anthropic.com".to_string()
+}
+
 /// Which kind of effect the shim is reporting.
 ///
 /// Defaults to `tool` so a shim that predates clock and randomness support
@@ -315,8 +343,7 @@ fn forward(
     headers: &[tiny_http::Header],
     session: &Arc<Mutex<Session>>,
 ) -> Result<tiny_http::Response<std::io::Cursor<Vec<u8>>>, Box<dyn std::error::Error>> {
-    let upstream_base = std::env::var("SAMSARA_UPSTREAM")
-        .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+    let upstream_base = upstream_for(url);
     let target = format!("{}{}", upstream_base.trim_end_matches('/'), url);
 
     let mut call = ureq::request(method, &target);
@@ -385,4 +412,41 @@ fn forward(
             tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
                 .expect("static header"),
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upstream_for;
+
+    /// `SAMSARA_UPSTREAM` is process-global, so these run under one lock and
+    /// one test rather than racing each other.
+    #[test]
+    fn requests_reach_the_provider_they_were_meant_for() {
+        std::env::remove_var("SAMSARA_UPSTREAM");
+
+        for path in ["/v1/messages", "/v1/complete", "/v1/messages/count_tokens"] {
+            assert_eq!(upstream_for(path), "https://api.anthropic.com", "{path}");
+        }
+        for path in [
+            "/v1/chat/completions",
+            "/v1/responses",
+            "/v1/embeddings",
+            "/v1/completions",
+        ] {
+            assert_eq!(upstream_for(path), "https://api.openai.com", "{path}");
+        }
+
+        // An unknown path falls back rather than failing: a provider we have
+        // not enumerated is better served by a guess than by a hard error,
+        // and `SAMSARA_UPSTREAM` is the way out.
+        assert_eq!(upstream_for("/v2/something"), "https://api.anthropic.com");
+
+        // The override wins everywhere, which is how the tests point at a
+        // stub and how anyone on a gateway or a proxy points at theirs.
+        std::env::set_var("SAMSARA_UPSTREAM", "http://127.0.0.1:9999");
+        for path in ["/v1/messages", "/v1/chat/completions", "/anything"] {
+            assert_eq!(upstream_for(path), "http://127.0.0.1:9999", "{path}");
+        }
+        std::env::remove_var("SAMSARA_UPSTREAM");
+    }
 }
