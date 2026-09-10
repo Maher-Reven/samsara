@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Samsara — agent replay timeline</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfaf8;
+    --panel: #ffffff;
+    --ink: #16150f;
+    --muted: #6b6862;
+    --line: #e4e0d8;
+    --accent: #7c3aed;
+    --bad: #c2410c;
+    --bad-bg: #fef2ec;
+    --good: #15803d;
+    --good-bg: #f0fdf4;
+    --warn: #a16207;
+    --warn-bg: #fefce8;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14131a;
+      --panel: #1c1b23;
+      --ink: #eceaf3;
+      --muted: #9995a6;
+      --line: #2e2c38;
+      --accent: #a78bfa;
+      --bad: #fb923c;
+      --bad-bg: #2a1a12;
+      --good: #4ade80;
+      --good-bg: #11241a;
+      --warn: #fbbf24;
+      --warn-bg: #2a2312;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 32px 24px 80px; }
+
+  header h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: -0.02em; }
+  header p { margin: 0; color: var(--muted); max-width: 60ch; }
+  .badges { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+  .badge {
+    font: 11px/1 var(--mono); text-transform: uppercase; letter-spacing: .07em;
+    padding: 6px 9px; border: 1px solid var(--line); border-radius: 5px; color: var(--muted);
+  }
+
+  .controls {
+    display: flex; gap: 10px; flex-wrap: wrap; align-items: center;
+    margin: 26px 0 18px; padding: 14px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 10px;
+  }
+  button {
+    font: inherit; font-size: 13px; padding: 7px 13px; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+    cursor: pointer; transition: border-color .12s, background .12s;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover:not(:disabled) { filter: brightness(1.08); }
+  .spacer { flex: 1; }
+  label.toggle { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 7px; }
+
+  .lanes { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 860px) { .lanes { grid-template-columns: 1fr; } }
+
+  .lane { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .lane > h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted);
+    margin: 0; padding: 13px 15px; border-bottom: 1px solid var(--line);
+    display: flex; justify-content: space-between; align-items: baseline; gap: 10px;
+  }
+  .lane > h2 .hint { text-transform: none; letter-spacing: 0; font-weight: 400; }
+
+  .events { list-style: none; margin: 0; padding: 6px; min-height: 60px; }
+  .event {
+    display: grid; grid-template-columns: 26px 62px 1fr auto; gap: 10px; align-items: center;
+    padding: 9px 10px; border-radius: 7px; font-size: 13px;
+    border: 1px solid transparent;
+  }
+  .event.clickable { cursor: pointer; }
+  .event.clickable:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); border-color: var(--line); }
+  .event .seq { font: 11px var(--mono); color: var(--muted); text-align: right; }
+  .event .kind {
+    font: 10px/1 var(--mono); text-transform: uppercase; letter-spacing: .06em;
+    color: var(--muted); border: 1px solid var(--line); border-radius: 4px;
+    padding: 4px 5px; text-align: center;
+  }
+  .event .name { font-family: var(--mono); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .event .tag { font: 10px var(--mono); color: var(--muted); }
+
+  .event.faulted { background: var(--bad-bg); border-color: color-mix(in srgb, var(--bad) 35%, transparent); }
+  .event.faulted .name { color: var(--bad); }
+  .event.faulted .tag { color: var(--bad); font-weight: 600; }
+  .event.added { background: var(--warn-bg); border-color: color-mix(in srgb, var(--warn) 30%, transparent); }
+  .event.added .tag { color: var(--warn); }
+  .event.violating { box-shadow: inset 3px 0 0 var(--bad); }
+
+  .shadow {
+    grid-column: 3 / -1; font: 11px var(--mono); color: var(--bad);
+    padding: 2px 0 0; opacity: .85;
+  }
+
+  .verdict { margin-top: 16px; border-radius: 10px; border: 1px solid var(--line); padding: 15px; background: var(--panel); }
+  .verdict.pass { background: var(--good-bg); border-color: color-mix(in srgb, var(--good) 30%, transparent); }
+  .verdict.fail { background: var(--bad-bg); border-color: color-mix(in srgb, var(--bad) 35%, transparent); }
+  .verdict h3 { margin: 0 0 6px; font-size: 14px; }
+  .verdict.pass h3 { color: var(--good); }
+  .verdict.fail h3 { color: var(--bad); }
+  .verdict p { margin: 4px 0 0; font-size: 13px; color: var(--ink); }
+  .verdict code { font-family: var(--mono); font-size: 12px; }
+
+  dialog {
+    border: 1px solid var(--line); border-radius: 11px; padding: 0;
+    background: var(--panel); color: var(--ink); max-width: 380px; width: 92vw;
+  }
+  dialog::backdrop { background: rgba(0,0,0,.45); }
+  dialog h3 { margin: 0; padding: 14px 16px; border-bottom: 1px solid var(--line); font-size: 14px; }
+  dialog .body { padding: 10px; display: grid; gap: 6px; }
+  dialog button { text-align: left; width: 100%; }
+  dialog .desc { display: block; font-size: 11.5px; color: var(--muted); margin-top: 3px; }
+
+  .note { margin-top: 22px; font-size: 13px; color: var(--muted); }
+  .note code { font-family: var(--mono); font-size: 12px; }
+  footer { margin-top: 34px; padding-top: 16px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Samsara</h1>
+    <p>
+      An agent deletes a file. Break one call and watch what it does next.
+      Everything below runs the real Rust engine, compiled to WebAssembly —
+      no server, no API key, nothing recorded about you.
+    </p>
+    <div class="badges">
+      <span class="badge" id="engine">engine …</span>
+      <span class="badge">deterministic replay</span>
+      <span class="badge">counterfactual fork</span>
+    </div>
+  </header>
+
+  <div class="controls">
+    <button class="primary" id="search">Find a bug for me</button>
+    <button id="reset">Reset</button>
+    <span class="spacer"></span>
+    <label class="toggle">
+      <input type="checkbox" id="fixed"> use the fixed agent
+    </label>
+  </div>
+
+  <div class="lanes">
+    <section class="lane">
+      <h2>Recording <span class="hint">click an effect to break it</span></h2>
+      <ul class="events" id="recording"></ul>
+    </section>
+    <section class="lane">
+      <h2>Counterfactual <span class="hint" id="schedule">no faults</span></h2>
+      <ul class="events" id="branch"></ul>
+    </section>
+  </div>
+
+  <div class="verdict" id="verdict"></div>
+
+  <p class="note">
+    The recording on the left is a run that succeeded — three effects, nothing
+    wrong with it. That is the point: the bug is not in the run you have, it
+    is in the run you did not have. Break the <code>delete_file</code> call
+    and the agent retries a call that had already taken effect.
+  </p>
+
+  <footer>
+    Samsara · deterministic replay and fault injection for LLM agents
+  </footer>
+</div>
+
+<dialog id="palette">
+  <h3>Break this effect</h3>
+  <div class="body" id="palette-body"></div>
+</dialog>
+
+<script type="module">
+import init, { Session, version } from "./pkg/samsara_wasm.js";
+
+const FAULTS = [
+  { label: "Timeout",        fault: { type: "timeout" },
+    desc: "The call never returns. The agent cannot tell whether it took effect." },
+  { label: "Error 503",      fault: { type: "error", code: "503" },
+    desc: "A gateway error — possibly after the work was already done." },
+  { label: "Truncate",       fault: { type: "truncate", keep: 12 },
+    desc: "The response is cut short mid-flight." },
+  { label: "Malformed JSON", fault: { type: "malformed" },
+    desc: "The response arrives corrupt." },
+  { label: "Delay 4s",       fault: { type: "delay", ms: 4000 },
+    desc: "Correct, but late." },
+];
+
+let session, points = [], recording;
+
+const $ = (id) => document.getElementById(id);
+
+function scheduleJson() {
+  return JSON.stringify({ points });
+}
+
+function renderEvents(node, events, { clickable = false, violations = [], baseline = null } = {}) {
+  const flagged = new Set(violations.map((v) => v.at_seq));
+  node.replaceChildren();
+
+  events.forEach((event) => {
+    const li = document.createElement("li");
+    li.className = "event";
+    if (clickable) li.classList.add("clickable");
+    if (event.fault) li.classList.add("faulted");
+    if (flagged.has(event.seq)) li.classList.add("violating");
+    // An effect with no counterpart in the recording is one the fork caused.
+    if (baseline && event.seq >= baseline) li.classList.add("added");
+
+    const tag = event.fault
+      ? `injected ${event.fault}`
+      : flagged.has(event.seq)
+        ? "duplicate"
+        : event.id_short;
+
+    li.innerHTML = `
+      <span class="seq">${event.seq}</span>
+      <span class="kind">${event.kind}</span>
+      <span class="name">${describe(event)}</span>
+      <span class="tag">${tag}</span>`;
+
+    // The shadow is the whole trick: show what the fault hid.
+    if (event.shadow) {
+      const shadow = document.createElement("span");
+      shadow.className = "shadow";
+      shadow.textContent = `↳ really returned: ${summarise(event.shadow)}`;
+      li.append(shadow);
+    }
+
+    if (clickable) li.onclick = () => openPalette(event.seq);
+    node.append(li);
+  });
+}
+
+function describe(event) {
+  const body = event.request?.body;
+  if (event.kind === "tool" && body?.path) {
+    return `${event.name}(${body.path})`;
+  }
+  if (event.kind === "model") {
+    return `${event.name} · ${body?.step ?? ""}`;
+  }
+  return event.name;
+}
+
+function summarise(outcome) {
+  if (!outcome) return "—";
+  if (outcome.status === "ok") return JSON.stringify(outcome.value).slice(0, 70);
+  return `${outcome.code}: ${outcome.message}`.slice(0, 70);
+}
+
+function renderVerdict(run) {
+  const node = $("verdict");
+  const violations = run.violations ?? [];
+
+  if (!points.length) {
+    node.className = "verdict";
+    node.innerHTML = `<h3>No faults applied</h3>
+      <p>The recording holds. Click an effect on the left, or let Samsara search
+      for a schedule that breaks the agent.</p>`;
+    return;
+  }
+
+  if (!violations.length) {
+    node.className = "verdict pass";
+    node.innerHTML = `<h3>✓ Survived</h3>
+      <p>The agent handled this schedule without breaking an invariant${
+        run.holes ? ` (${run.holes} effect(s) the recording could not answer)` : ""
+      }.</p>`;
+    return;
+  }
+
+  node.className = "verdict fail";
+  node.innerHTML = `<h3>✗ ${violations.length} invariant violated</h3>` +
+    violations.map((v) => `<p><code>${v.invariant}</code> — ${v.detail}</p>`).join("");
+}
+
+function refresh() {
+  const run = JSON.parse(session.fork(scheduleJson()));
+  renderEvents($("branch"), run.events, {
+    violations: run.violations,
+    baseline: recording.events.length,
+  });
+  renderEvents($("recording"), recording.events, { clickable: true });
+  $("schedule").textContent = points.length
+    ? points.map((p) => `#${p.seq} ${p.fault.type}`).join(", ")
+    : "no faults";
+  renderVerdict(run);
+}
+
+function openPalette(seq) {
+  const body = $("palette-body");
+  body.replaceChildren();
+
+  FAULTS.forEach(({ label, fault, desc }) => {
+    const button = document.createElement("button");
+    button.innerHTML = `${label}<span class="desc">${desc}</span>`;
+    button.onclick = () => {
+      points = points.filter((p) => p.seq !== seq).concat([{ seq, fault }]);
+      points.sort((a, b) => a.seq - b.seq);
+      $("palette").close();
+      refresh();
+    };
+    body.append(button);
+  });
+
+  if (points.some((p) => p.seq === seq)) {
+    const clear = document.createElement("button");
+    clear.textContent = "Remove fault";
+    clear.onclick = () => {
+      points = points.filter((p) => p.seq !== seq);
+      $("palette").close();
+      refresh();
+    };
+    body.append(clear);
+  }
+
+  $("palette").showModal();
+}
+
+function load() {
+  session = new Session($("fixed").checked ? "idempotent" : "naive");
+  recording = JSON.parse(session.recording());
+  points = [];
+  refresh();
+}
+
+await init();
+$("engine").textContent = `engine ${version()} · wasm`;
+load();
+
+$("reset").onclick = load;
+$("fixed").onchange = load;
+
+$("search").onclick = () => {
+  const button = $("search");
+  button.disabled = true;
+  button.textContent = "Searching…";
+
+  // Yield once so the button repaints before the engine blocks the thread.
+  setTimeout(() => {
+    const finding = JSON.parse(session.search(500, 4));
+    if (!finding) {
+      $("verdict").className = "verdict pass";
+      $("verdict").innerHTML = `<h3>✓ No seed broke it</h3>
+        <p>500 schedules tried. This agent handled all of them.</p>`;
+    } else {
+      // Show the *minimised* schedule: the whole point is that the bug is
+      // one fault, not the pile the search happened to find.
+      points = finding.shrunk.points;
+      refresh();
+      const node = $("verdict");
+      node.insertAdjacentHTML("beforeend",
+        `<p style="margin-top:9px;opacity:.8">Found at seed <code>${finding.seed}</code>
+         as <code>${finding.description}</code>, shrunk to
+         <code>${finding.shrunk_description}</code> in ${finding.evaluations} replays.</p>`);
+    }
+    button.disabled = false;
+    button.textContent = "Find a bug for me";
+  }, 16);
+};
+</script>
+</body>
+</html>
