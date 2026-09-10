@@ -109,12 +109,22 @@ curl -sS -X POST "$ANTHROPIC_BASE_URL/v1/messages" \
 DECISION=$(curl -sS -X POST "$SAMSARA_ENDPOINT/begin" \
   -H 'content-type: application/json' \
   -d '{"name":"delete_file","body":{"path":"/var/reports/stale.csv"}}')
-echo "$DECISION" | grep -q 'execute' || { echo "unexpected decision: $DECISION" >&2; exit 3; }
-
-curl -sS -X POST "$SAMSARA_ENDPOINT/end" \
-  -H 'content-type: application/json' \
-  -d '{"outcome":{"status":"ok","value":{"ok":true,"path":"/var/reports/stale.csv"}}}' \
-  > /dev/null
+case "$DECISION" in
+  *'"action":"return"'*)
+    # Replay: the engine already knows the answer, so the tool must not run.
+    ;;
+  *'"action":"execute"'*)
+    # Recording: do the work, then report it. The side effect is a file, so
+    # a test can assert on whether the world was really touched.
+    echo "deleted" >> "$SIDE_EFFECT_LOG"
+    curl -sS -X POST "$SAMSARA_ENDPOINT/end" \
+      -H 'content-type: application/json' \
+      -d '{"outcome":{"status":"ok","value":{"ok":true,"path":"/var/reports/stale.csv"}}}' \
+      > /dev/null
+    ;;
+  *)
+    echo "unexpected decision: $DECISION" >&2; exit 3 ;;
+esac
 "#;
 
 /// Run `samsara record` around a shell agent. Returns the trace path.
@@ -130,6 +140,7 @@ fn record(dir: &Path, upstream: &Upstream, agent: &str) -> PathBuf {
             .arg("--")
             .args(["sh", "-c", agent])
             .env("SAMSARA_UPSTREAM", upstream.url())
+            .env("SIDE_EFFECT_LOG", dir.join("side-effects.log"))
             .output()
             .expect("the samsara binary runs");
 
@@ -388,6 +399,7 @@ fn the_child_exit_code_does_not_lose_the_trace() {
         .arg("--")
         .args(["sh", "-c", &agent])
         .env("SAMSARA_UPSTREAM", upstream.url())
+        .env("SIDE_EFFECT_LOG", dir.join("side-effects.log"))
         .output()
         .expect("binary runs");
 
@@ -398,4 +410,179 @@ fn the_child_exit_code_does_not_lose_the_trace() {
     );
     let trace = read_trace(&out);
     assert_eq!(trace["events"].as_array().unwrap().len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Replay
+// ---------------------------------------------------------------------------
+
+/// How many times the agent really performed its side effect.
+fn side_effects(dir: &Path) -> usize {
+    std::fs::read_to_string(dir.join("side-effects.log"))
+        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0)
+}
+
+/// Run `samsara replay`. Returns its combined output and whether it succeeded.
+fn replay(dir: &Path, trace: &Path, extra: &[&str], agent: &str) -> (String, bool) {
+    for attempt in 0..4 {
+        let out = samsara()
+            .arg("replay")
+            .arg(trace)
+            .args(["--port", &free_port().to_string()])
+            .args(extra)
+            .arg("--")
+            .args(["sh", "-c", agent])
+            .env("SIDE_EFFECT_LOG", dir.join("side-effects.log"))
+            // No SAMSARA_UPSTREAM on purpose: a replay that reaches for a
+            // provider should fail loudly, not quietly succeed.
+            .env_remove("SAMSARA_UPSTREAM")
+            .output()
+            .expect("the samsara binary runs");
+
+        let text = String::from_utf8_lossy(&out.stdout).to_string()
+            + &String::from_utf8_lossy(&out.stderr);
+        // Distinguish "lost the port race" from "replay reported a failure".
+        if out.status.success() || !text.contains("cannot bind") {
+            return (text, out.status.success());
+        }
+        if attempt == 3 {
+            panic!("replay never got a port: {text}");
+        }
+    }
+    unreachable!()
+}
+
+#[test]
+fn strict_replay_of_an_unchanged_agent_finds_no_divergence() {
+    let dir = scratch("replay-strict");
+    let upstream = Upstream::start();
+    let trace = record(&dir, &upstream, AGENT);
+
+    assert_eq!(
+        side_effects(&dir),
+        1,
+        "recording really performed the effect"
+    );
+    assert_eq!(upstream.served(), 1);
+    std::fs::remove_file(dir.join("side-effects.log")).ok();
+
+    let (text, ok) = replay(&dir, &trace, &["--strict"], AGENT);
+
+    assert!(ok, "an unchanged agent must replay cleanly:\n{text}");
+    assert!(text.contains("no divergence"), "{text}");
+
+    // The two claims that make replay worth having at all.
+    assert_eq!(
+        side_effects(&dir),
+        0,
+        "replay must not perform the side effect — this is the entire point"
+    );
+    assert_eq!(
+        upstream.served(),
+        1,
+        "replay must not call the provider: still just the one recording call"
+    );
+}
+
+#[test]
+fn strict_replay_catches_an_agent_that_changed() {
+    let dir = scratch("replay-changed");
+    let upstream = Upstream::start();
+    let trace = record(&dir, &upstream, AGENT);
+
+    // The same agent, now deleting a different file — the shape of a real
+    // regression, where an edit quietly changes a tool argument.
+    let changed = AGENT.replace("/var/reports/stale.csv", "/var/reports/OTHER.csv");
+    let (text, ok) = replay(&dir, &trace, &["--strict"], &changed);
+
+    assert!(!ok, "a changed agent must fail strict replay:\n{text}");
+    assert!(text.contains("divergence"), "{text}");
+    assert!(
+        text.contains("path"),
+        "the report must name the field that changed:\n{text}"
+    );
+}
+
+#[test]
+fn a_fault_makes_the_agent_retry_and_duplicate_its_side_effect() {
+    let dir = scratch("replay-fault");
+    let upstream = Upstream::start();
+
+    // An agent that retries once on a failed tool call, written the way real
+    // agents are: a failure is treated as "it did not happen".
+    let retrying = r#"
+curl -sS -X POST "$ANTHROPIC_BASE_URL/v1/messages" \
+  -H 'content-type: application/json' \
+  -d '{"model":"claude-sonnet-4","messages":[{"role":"user","content":"remove the stale report"}]}' \
+  > /dev/null
+
+attempt() {
+  DECISION=$(curl -sS -X POST "$SAMSARA_ENDPOINT/begin" \
+    -H 'content-type: application/json' \
+    -d '{"name":"delete_file","body":{"path":"/var/reports/stale.csv"}}')
+  case "$DECISION" in
+    *'"status":"err"'*) return 1 ;;
+    *'"action":"return"'*) return 0 ;;
+    *)
+      echo "deleted" >> "$SIDE_EFFECT_LOG"
+      curl -sS -X POST "$SAMSARA_ENDPOINT/end" \
+        -H 'content-type: application/json' \
+        -d '{"outcome":{"status":"ok","value":{"ok":true}}}' > /dev/null
+      return 0 ;;
+  esac
+}
+attempt || attempt
+"#;
+
+    let trace = record(&dir, &upstream, retrying);
+    assert_eq!(
+        side_effects(&dir),
+        1,
+        "the recording deleted it exactly once"
+    );
+
+    // Now fault the tool call: the agent is told it failed and tries again,
+    // against a call that had already taken effect.
+    let (text, ok) = replay(
+        &dir,
+        &trace,
+        &[
+            "--seed",
+            "0",
+            "--max-faults",
+            "4",
+            "--effectful",
+            "delete_file",
+        ],
+        retrying,
+    );
+
+    assert!(
+        !ok,
+        "a duplicated side effect must exit non-zero so CI catches it:\n{text}"
+    );
+    assert!(
+        text.contains("no_duplicate_effects"),
+        "and must name the invariant that broke:\n{text}"
+    );
+}
+
+#[test]
+fn replay_writes_a_branch_that_records_its_parent() {
+    let dir = scratch("replay-branch");
+    let upstream = Upstream::start();
+    let trace = record(&dir, &upstream, AGENT);
+    let branch = dir.join("branch.samsara.jsonl");
+
+    let (text, _) = replay(&dir, &trace, &["--out", branch.to_str().unwrap()], AGENT);
+    assert!(branch.exists(), "branch trace was not written:\n{text}");
+
+    let parsed = read_trace(&branch);
+    assert!(!parsed["events"].as_array().unwrap().is_empty());
+    assert_eq!(
+        parsed["header"]["parent"].as_str().map(|s| s.len()),
+        Some(64),
+        "a branch must record the trace it forked from"
+    );
 }
