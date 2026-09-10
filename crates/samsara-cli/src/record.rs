@@ -33,6 +33,7 @@
 //! — it cannot drift from the engine, and porting it to another language is
 //! an afternoon rather than a project.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,14 +49,25 @@ struct Session {
     cas: FsCas,
     canon: Canonicalizer,
     events: Vec<Event>,
-    /// The effect currently in flight on the tool protocol, if any.
-    pending: Option<EffectRequest>,
+    /// Tool calls begun but not yet finished, keyed by call id.
+    ///
+    /// This was a single `Option` until concurrency arrived, which was a
+    /// correlation bug waiting for exactly the conditions this tool exists
+    /// to reproduce: two calls in flight, and whichever finished first
+    /// claimed the other's request.
+    pending: HashMap<String, (EffectRequest, Option<u64>)>,
+    next_call: u64,
     logical_time: u64,
 }
 
 impl Session {
     /// Record a completed effect and return the outcome to surface.
-    fn record(&mut self, request: &EffectRequest, outcome: &Outcome) -> std::io::Result<()> {
+    fn record(
+        &mut self,
+        request: &EffectRequest,
+        outcome: &Outcome,
+        batch: Option<u64>,
+    ) -> std::io::Result<()> {
         let identity = request.identity(&self.canon);
         let request_digest = self.cas.put(&serde_json::to_vec(request)?)?;
         let outcome_digest = self.cas.put(&serde_json::to_vec(outcome)?)?;
@@ -70,11 +82,7 @@ impl Session {
             fault: None,
             shadow: None,
             logical_time: self.logical_time,
-            // The recording proxy sees effects one at a time over HTTP and
-            // cannot yet tell "concurrently in flight" from "back to back",
-            // so it never groups them. Concurrency is modelled in-process
-            // today; see the README.
-            batch: None,
+            batch,
         });
         self.logical_time += 1;
         Ok(())
@@ -92,7 +100,8 @@ pub fn run(out: &Path, port: u16, command: &[String]) -> Result<(), Box<dyn std:
         cas: FsCas::open(&objects)?,
         canon: Canonicalizer::default(),
         events: Vec::new(),
-        pending: None,
+        pending: HashMap::new(),
+        next_call: 0,
         logical_time: 0,
     }));
 
@@ -137,6 +146,24 @@ pub fn run(out: &Path, port: u16, command: &[String]) -> Result<(), Box<dyn std:
     let _ = serving.join();
 
     let session = session.lock().unwrap();
+
+    // A batch of one is not a batch. The shim assigns an id to every call
+    // because it cannot know at begin time whether anything will join, so
+    // the lone ones are cleared here rather than left to imply a concurrency
+    // that never happened.
+    let mut events = session.events.clone();
+    let mut sizes: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for event in &events {
+        if let Some(batch) = event.batch {
+            *sizes.entry(batch).or_default() += 1;
+        }
+    }
+    for event in &mut events {
+        if event.batch.is_some_and(|b| sizes[&b] < 2) {
+            event.batch = None;
+        }
+    }
+
     let trace = Trace {
         header: TraceHeader {
             label: command.join(" "),
@@ -144,7 +171,7 @@ pub fn run(out: &Path, port: u16, command: &[String]) -> Result<(), Box<dyn std:
             recorded_at_ms: now_ms(),
             ..TraceHeader::default()
         },
-        events: session.events.clone(),
+        events,
     };
     std::fs::write(out, trace.to_jsonl())?;
 
@@ -217,9 +244,21 @@ fn tool_protocol(
                     .to_string(),
                 body: incoming.get("body").cloned().unwrap_or(Value::Null),
             };
-            session.lock().unwrap().pending = Some(request);
+            // The shim reports which burst of concurrency this call belongs
+            // to. Only the agent's own process can observe that; over HTTP
+            // "concurrent" and "back to back" are indistinguishable.
+            let batch = incoming.get("batch").and_then(|v| v.as_u64());
+
+            let mut session = session.lock().unwrap();
+            let call = format!("c{}", session.next_call);
+            session.next_call += 1;
+            session.pending.insert(call.clone(), (request, batch));
+
             // Recording: the shim goes and does the work.
-            Ok(json_response(200, json!({"action": "execute"})))
+            Ok(json_response(
+                200,
+                json!({"action": "execute", "call": call}),
+            ))
         }
 
         "/end" => {
@@ -228,10 +267,20 @@ fn tool_protocol(
                 .get("outcome")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_else(|| Outcome::ok(incoming.clone()));
+            let call = incoming.get("call").and_then(|v| v.as_str()).unwrap_or("");
 
             let mut session = session.lock().unwrap();
-            if let Some(request) = session.pending.take() {
-                session.record(&request, &outcome)?;
+            match session.pending.remove(call) {
+                Some((request, batch)) => session.record(&request, &outcome, batch)?,
+                None => {
+                    // An /end naming no live call. Recording it would attach
+                    // the outcome to nothing; dropping it silently would hide
+                    // a broken shim.
+                    eprintln!(
+                        "{} /end for unknown call {call:?}, ignoring",
+                        ui::yellow("proxy:")
+                    );
+                }
             }
             Ok(json_response(200, json!({"outcome": outcome})))
         }
@@ -313,7 +362,7 @@ fn forward(
     session
         .lock()
         .unwrap()
-        .record(&EffectRequest::model(model, parsed_request), &outcome)?;
+        .record(&EffectRequest::model(model, parsed_request), &outcome, None)?;
 
     Ok(tiny_http::Response::from_data(response_body.into_bytes())
         .with_status_code(status)

@@ -28,8 +28,8 @@
 
 /** What the engine says to do with a tool call. */
 type Decision =
-  | { action: "execute" }
-  | { action: "return"; outcome: Outcome };
+  | { action: "execute"; call: string }
+  | { action: "return"; call: string; outcome: Outcome };
 
 /** How an effect resolved. Mirrors the Rust `Outcome` enum. */
 export type Outcome =
@@ -51,6 +51,32 @@ export class SamsaraToolError extends Error {
 }
 
 const endpoint = (): string | undefined => process.env.SAMSARA_ENDPOINT;
+
+/**
+ * Concurrency bookkeeping.
+ *
+ * The engine cannot see which tool calls the agent issued together: over HTTP
+ * "concurrently in flight" and "back to back" look identical. Only this
+ * process knows, so the shim reports it.
+ *
+ * That is not policy creeping into the shim — it is an observation only the
+ * shim can make. It reports the fact; the engine decides what it means. A
+ * batch id changes whenever the in-flight count returns to zero, so every
+ * call in one burst of concurrency shares one, and a call made on its own
+ * gets an id nobody else joins.
+ */
+let inFlight = 0;
+let currentBatch = 0;
+
+function enterBatch(): number {
+  if (inFlight === 0) currentBatch += 1;
+  inFlight += 1;
+  return currentBatch;
+}
+
+function leaveBatch(): void {
+  inFlight = Math.max(0, inFlight - 1);
+}
 
 async function post(path: string, body: unknown): Promise<any> {
   const base = endpoint();
@@ -91,26 +117,41 @@ export function wrapTool(name: string, tool: Tool): Tool {
   if (!endpoint()) return tool;
 
   return async (args: any) => {
-    const decision: Decision = await post("/begin", { name, body: args ?? null });
-
-    // Replaying, or a fault applies: the engine already knows the answer and
-    // the real tool must not run. This is what makes replay free and safe —
-    // no file is deleted twice while you are debugging why a file was
-    // deleted twice.
-    if (decision.action === "return") {
-      return surface(decision.outcome);
-    }
-
-    let outcome: Outcome;
+    const batch = enterBatch();
     try {
-      outcome = { status: "ok", value: await tool(args) };
-    } catch (error) {
-      outcome = capture(error);
-    }
+      const decision: Decision = await post("/begin", {
+        name,
+        body: args ?? null,
+        batch,
+      });
 
-    // The engine may perturb the outcome before we surface it.
-    const { outcome: final } = await post("/end", { outcome });
-    return surface(final);
+      // Replaying, or a fault applies: the engine already knows the answer
+      // and the real tool must not run. This is what makes replay free and
+      // safe — no file is deleted twice while you are debugging why a file
+      // was deleted twice.
+      if (decision.action === "return") {
+        return surface(decision.outcome);
+      }
+
+      let outcome: Outcome;
+      try {
+        outcome = { status: "ok", value: await tool(args) };
+      } catch (error) {
+        outcome = capture(error);
+      }
+
+      // `call` correlates this result with its begin. Without it two
+      // concurrent calls would race to claim each other's outcomes, which is
+      // a bug you would only ever see under the exact conditions this
+      // release exists to reproduce.
+      const { outcome: final } = await post("/end", {
+        call: decision.call,
+        outcome,
+      });
+      return surface(final);
+    } finally {
+      leaveBatch();
+    }
   };
 }
 
@@ -126,4 +167,10 @@ export function wrapTools<T extends Record<string, Tool>>(tools: T): T {
 /** Whether Samsara is attached to this process. */
 export function isAttached(): boolean {
   return endpoint() !== undefined;
+}
+
+/** Reset concurrency bookkeeping. Exposed for tests. */
+export function __resetBatches(): void {
+  inFlight = 0;
+  currentBatch = 0;
 }

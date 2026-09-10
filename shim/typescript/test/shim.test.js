@@ -13,7 +13,8 @@ import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 
 process.env.SAMSARA_ENDPOINT = "http://127.0.0.1:0/_samsara";
-const { wrapTool, wrapTools, isAttached, SamsaraToolError } = await import("../dist/index.js");
+const { wrapTool, wrapTools, isAttached, SamsaraToolError, __resetBatches } =
+  await import("../dist/index.js");
 
 const realFetch = globalThis.fetch;
 let calls = [];
@@ -30,7 +31,7 @@ function stub(replies) {
   };
 }
 
-beforeEach(() => { calls = []; });
+beforeEach(() => { calls = []; __resetBatches(); });
 afterEach(() => { globalThis.fetch = realFetch; });
 
 test("isAttached reflects the environment", () => {
@@ -39,7 +40,7 @@ test("isAttached reflects the environment", () => {
 
 test("recording: the real tool runs and its result is reported", async () => {
   stub({
-    "/begin": { action: "execute" },
+    "/begin": { action: "execute", call: "c1" },
     "/end": { outcome: { status: "ok", value: { ok: true } } },
   });
 
@@ -54,14 +55,15 @@ test("recording: the real tool runs and its result is reported", async () => {
   assert.equal(ran, 1, "the tool must actually run while recording");
   assert.deepEqual(result, { ok: true });
   assert.deepEqual(calls.map((c) => c.path), ["/begin", "/end"]);
-  assert.deepEqual(calls[0].body, { name: "delete_file", body: { path: "/x" } });
+  assert.deepEqual(calls[0].body, { name: "delete_file", body: { path: "/x" }, batch: 1 });
+  assert.equal(calls[1].body.call, "c1", "the end must name the call it finishes");
   assert.deepEqual(calls[1].body.outcome, { status: "ok", value: { ok: true, path: "/x" } });
 });
 
 test("replay: the real tool does NOT run", async () => {
   // The single most important property in this file. If the shim executes a
   // tool during replay, replaying a run that deleted a file deletes it again.
-  stub({ "/begin": { action: "return", outcome: { status: "ok", value: "recorded" } } });
+  stub({ "/begin": { action: "return", call: "c1", outcome: { status: "ok", value: "recorded" } } });
 
   let ran = 0;
   const del = wrapTool("delete_file", async () => { ran += 1; return "live"; });
@@ -75,7 +77,7 @@ test("replay: the real tool does NOT run", async () => {
 
 test("an injected fault surfaces as a throw", async () => {
   stub({
-    "/begin": { action: "execute" },
+    "/begin": { action: "execute", call: "c1" },
     "/end": { outcome: { status: "err", code: "timeout", message: "injected" } },
   });
 
@@ -91,7 +93,7 @@ test("an injected fault surfaces as a throw", async () => {
 test("the engine may fault an outcome the tool reported as success", async () => {
   // The lost-response case: the work happened, the caller is told it did not.
   stub({
-    "/begin": { action: "execute" },
+    "/begin": { action: "execute", call: "c1" },
     "/end": { outcome: { status: "err", code: "timeout", message: "lost in flight" } },
   });
 
@@ -105,7 +107,7 @@ test("the engine may fault an outcome the tool reported as success", async () =>
 
 test("a throwing tool is recorded rather than lost", async () => {
   stub({
-    "/begin": { action: "execute" },
+    "/begin": { action: "execute", call: "c1" },
     "/end": { outcome: { status: "err", code: "tool_error", message: "disk on fire" } },
   });
 
@@ -123,7 +125,7 @@ test("a throwing tool is recorded rather than lost", async () => {
 
 test("wrapTools wraps every entry and preserves names", async () => {
   stub({
-    "/begin": { action: "return", outcome: { status: "ok", value: 1 } },
+    "/begin": { action: "return", call: "c1", outcome: { status: "ok", value: 1 } },
   });
 
   const tools = wrapTools({
@@ -137,7 +139,7 @@ test("wrapTools wraps every entry and preserves names", async () => {
 });
 
 test("null arguments are sent as null, not dropped", async () => {
-  stub({ "/begin": { action: "return", outcome: { status: "ok", value: null } } });
+  stub({ "/begin": { action: "return", call: "c1", outcome: { status: "ok", value: null } } });
   const t = wrapTool("ping", async () => "live");
   await t(undefined);
   assert.equal(calls[0].body.body, null);
@@ -157,4 +159,87 @@ test("detached: wrapTools is a pass-through", async () => {
   assert.equal(tools.delete_file, original, "must be the very same function, not a wrapper");
 
   process.env.SAMSARA_ENDPOINT = saved;
+});
+
+// ---------------------------------------------------------------------------
+// Concurrency
+// ---------------------------------------------------------------------------
+
+test("calls issued together share a batch id", async () => {
+  // The engine cannot tell "concurrently in flight" from "back to back" over
+  // HTTP. Only this process knows, so the shim reports it.
+  let release;
+  const gate = new Promise((r) => (release = r));
+
+  globalThis.fetch = async (url, init) => {
+    const path = String(url).slice(String(url).indexOf("/_samsara") + "/_samsara".length);
+    const body = JSON.parse(init.body);
+    calls.push({ path, body });
+    if (path === "/begin") {
+      // Hold every begin open, so all three overlap.
+      await gate;
+      return { ok: true, status: 200, json: async () => ({ action: "execute", call: body.name }) };
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ outcome: { status: "ok", value: null } }),
+    };
+  };
+
+  const tools = wrapTools({
+    a: async () => "a",
+    b: async () => "b",
+    c: async () => "c",
+  });
+
+  const pending = Promise.all([tools.a({}), tools.b({}), tools.c({})]);
+  release();
+  await pending;
+
+  const batches = calls.filter((c) => c.path === "/begin").map((c) => c.body.batch);
+  assert.equal(batches.length, 3);
+  assert.equal(new Set(batches).size, 1, `all three overlapped: ${batches}`);
+});
+
+test("calls made one after another do not share a batch id", async () => {
+  stub({
+    "/begin": { action: "execute", call: "c1" },
+    "/end": { outcome: { status: "ok", value: null } },
+  });
+
+  const t = wrapTool("ping", async () => "ok");
+  await t({ n: 1 });
+  await t({ n: 2 });
+
+  const batches = calls.filter((c) => c.path === "/begin").map((c) => c.body.batch);
+  assert.equal(batches.length, 2);
+  assert.notEqual(batches[0], batches[1], "sequential calls are not a batch");
+});
+
+test("a throwing tool still closes its batch", async () => {
+  // If the in-flight count leaked, every later call would be folded into a
+  // batch that never ends, and the engine would think the agent had gone
+  // fully concurrent.
+  // Echo the reported outcome back, which is what an unfaulted engine does.
+  // Scripting a fixed error here would make the *second* call throw too, and
+  // the test would pass for the wrong reason.
+  calls = [];
+  globalThis.fetch = async (url, init) => {
+    const path = String(url).slice(String(url).indexOf("/_samsara") + "/_samsara".length);
+    const body = JSON.parse(init.body);
+    calls.push({ path, body });
+    const reply =
+      path === "/begin" ? { action: "execute", call: "c1" } : { outcome: body.outcome };
+    return { ok: true, status: 200, json: async () => reply };
+  };
+
+  const bad = wrapTool("bad", async () => { throw new Error("boom"); });
+  const good = wrapTool("good", async () => "ok");
+
+  await assert.rejects(() => bad({}));
+  await good({});
+
+  const batches = calls.filter((c) => c.path === "/begin").map((c) => c.body.batch);
+  assert.notEqual(batches[0], batches[1], "the failed call released its slot");
 });
