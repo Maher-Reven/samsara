@@ -38,6 +38,7 @@
 pub mod canon;
 pub mod cas;
 pub mod certificate;
+pub mod config;
 pub mod event;
 pub mod explore;
 pub mod fault;
@@ -55,15 +56,17 @@ pub mod prelude {
     pub use crate::canon::Canonicalizer;
     pub use crate::cas::{Cas, FsCas, MemCas};
     pub use crate::certificate::{Certificate, Verdict};
+    pub use crate::config::{Config, InvariantSpec};
     pub use crate::event::{EffectKind, EffectRequest, Event, Outcome};
     pub use crate::explore::{
-        evaluate, interleavings, minimise, search, search_order_dependence, sweep, Case, Coverage,
-        Finding, Interleavings, OrderDependence,
+        evaluate, interleavings, minimise, plan, search, search_order_dependence, sweep, Case,
+        Coverage, Finding, Interleavings, OrderDependence,
     };
     pub use crate::fault::{Fault, FaultPoint, FaultSchedule};
     pub use crate::hash::Digest;
     pub use crate::invariant::{
-        check_all, Invariant, NoDuplicateEffects, TerminatesWithin, TokenBudget, Violation,
+        check_all, Invariant, MaxCalls, NeverAfterFailure, NoDuplicateEffects, Requires,
+        TerminatesWithin, TokenBudget, Violation,
     };
     pub use crate::replay::{
         Backend, Divergence, DivergenceKind, Effects, Mode, Recorder, ReplayResult, Replayer,
