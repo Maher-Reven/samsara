@@ -22,8 +22,11 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tiny_http = "0.12"
+toml = "0.8"
 ureq = { version = "2", features = ["json"] }
 
 [dev-dependencies]
-# The end-to-end tests stand up a stub provider and drive the real binary.
+# The end-to-end tests stand up a stub provider and drive the real binary,
+# and read the config template back to check it parses.
 tiny_http = "0.12"
+toml = "0.8"

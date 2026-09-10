@@ -378,6 +378,97 @@ impl Coverage {
 /// network, so enumerating hundreds of them is a second of CPU rather than a
 /// bill. Random seed search is what you do when each attempt is expensive.
 /// Nothing here is expensive.
+/// The complete list of schedules a sweep will run.
+///
+/// Separated from execution so that a driver which cannot hand out a
+/// `Replayer` -- an agent in another process, say -- enumerates exactly the
+/// same space as the in-process one. Two enumerations that could drift would
+/// mean two different definitions of "exhaustive".
+#[derive(Clone, Debug)]
+pub struct Plan {
+    pub positions: usize,
+    pub kinds: usize,
+    pub singles: Vec<FaultSchedule>,
+    pub pairs: Vec<FaultSchedule>,
+}
+
+/// Enumerate every single fault, and every pair if asked.
+pub fn plan(trace: &Trace, include_pairs: bool) -> Plan {
+    let positions = trace.faultable();
+    let kinds = Fault::canonical_set();
+
+    let mut singles = Vec::new();
+    for &seq in &positions {
+        for fault in &kinds {
+            singles.push(FaultSchedule::of(vec![FaultPoint {
+                seq,
+                fault: fault.clone(),
+            }]));
+        }
+    }
+
+    let mut pairs = Vec::new();
+    if include_pairs {
+        for (i, &a) in positions.iter().enumerate() {
+            for &b in &positions[i + 1..] {
+                for fa in &kinds {
+                    for fb in &kinds {
+                        pairs.push(FaultSchedule::of(vec![
+                            FaultPoint {
+                                seq: a,
+                                fault: fa.clone(),
+                            },
+                            FaultPoint {
+                                seq: b,
+                                fault: fb.clone(),
+                            },
+                        ]));
+                    }
+                }
+            }
+        }
+    }
+
+    Plan {
+        positions: positions.len(),
+        kinds: kinds.len(),
+        singles,
+        pairs,
+    }
+}
+
+impl Coverage {
+    /// Start an empty tally for `plan`.
+    pub fn starting(plan: &Plan) -> Coverage {
+        Coverage {
+            positions: plan.positions,
+            kinds: plan.kinds,
+            singles_checked: 0,
+            singles_exhaustive: false,
+            pairs_checked: 0,
+            pairs_exhaustive: false,
+            replays: 0,
+            failures: Vec::new(),
+        }
+    }
+
+    /// Record one executed schedule.
+    pub fn record(&mut self, schedule: FaultSchedule, violations: Vec<Violation>) {
+        self.replays += 1;
+        match schedule.len() {
+            0 | 1 => self.singles_checked += 1,
+            _ => self.pairs_checked += 1,
+        }
+        if !violations.is_empty() {
+            self.failures.push(Case {
+                description: schedule.describe(),
+                schedule,
+                violations,
+            });
+        }
+    }
+}
+
 pub fn sweep<C, F>(
     trace: &Trace,
     cas: &mut C,
@@ -390,18 +481,12 @@ where
     C: Cas,
     F: FnMut(&mut Replayer<'_, C>),
 {
+    let plan = plan(trace, include_pairs);
+    let mut coverage = Coverage::starting(&plan);
+    coverage.singles_exhaustive = true;
+
     let positions = trace.faultable();
     let kinds = Fault::canonical_set();
-    let mut coverage = Coverage {
-        positions: positions.len(),
-        kinds: kinds.len(),
-        singles_checked: 0,
-        singles_exhaustive: true,
-        pairs_checked: 0,
-        pairs_exhaustive: false,
-        replays: 0,
-        failures: Vec::new(),
-    };
 
     let mut run = |schedule: FaultSchedule, cov: &mut Coverage, drive: &mut F| {
         cov.replays += 1;

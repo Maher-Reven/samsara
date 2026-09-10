@@ -15,6 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
+use samsara_core::explore::plan;
 use samsara_core::prelude::*;
 use samsara_core::testkit::{run_agent, run_assembler, Assembly, FakeBackend, Style};
 
@@ -54,7 +55,138 @@ pub fn run(
         Subject::Fixed => sweep_retry(Style::Idempotent, pairs, max_replays),
         Subject::Order => sweep_order(Assembly::AsTheyArrive, pairs, max_replays),
     };
+    finish(certificate, out, check)
+}
 
+/// Sweep a real agent: its own trace, its own properties, its own process.
+///
+/// Every schedule costs a process launch rather than a function call, so
+/// this is seconds where the in-process sweep is milliseconds. It is still
+/// exhaustive, and still free of tokens and network -- the expense is
+/// `fork`, not the model.
+pub struct External<'a> {
+    pub trace: &'a Path,
+    pub config: &'a Config,
+    pub pairs: bool,
+    pub max_replays: usize,
+    pub port: u16,
+    pub out: Option<PathBuf>,
+    pub check: Option<PathBuf>,
+    pub command: &'a [String],
+}
+
+pub fn run_external(options: External<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    let External {
+        trace: trace_path,
+        config,
+        pairs,
+        max_replays,
+        port,
+        out,
+        check,
+        command,
+    } = options;
+    if command.is_empty() {
+        return Err("nothing to run: pass the agent command after `--`".into());
+    }
+
+    let harness = crate::replay_cmd::Harness::start(trace_path, port)?;
+    let trace = harness.trace();
+    let plan = plan(trace, pairs);
+    let invariants = config.build();
+
+    let total = (plan.singles.len() + plan.pairs.len()).min(max_replays);
+    ui::info(&format!(
+        "{} single-fault schedules{}, {} replays of `{}`",
+        plan.singles.len(),
+        if pairs {
+            format!(" and {} pairs", plan.pairs.len())
+        } else {
+            String::new()
+        },
+        total,
+        command.join(" ")
+    ));
+
+    let mut coverage = Coverage::starting(&plan);
+    let objects = crate::objects_dir(trace_path);
+    let cas = FsCas::open(&objects)?;
+
+    let mut budget = max_replays;
+    let run_schedule = |schedule: FaultSchedule,
+                        coverage: &mut Coverage|
+     -> Result<(), Box<dyn std::error::Error>> {
+        let (result, _) = harness.run_once(
+            Mode::Counterfactual {
+                schedule: schedule.clone(),
+            },
+            command,
+        )?;
+        let violations = check_all(&result.branch, &cas, &invariants);
+        coverage.record(schedule, violations);
+        Ok(())
+    };
+
+    for schedule in &plan.singles {
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        run_schedule(schedule.clone(), &mut coverage)?;
+        progress(coverage.replays, total);
+    }
+    coverage.singles_exhaustive = coverage.singles_checked == plan.singles.len();
+
+    if coverage.singles_exhaustive {
+        for schedule in &plan.pairs {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            run_schedule(schedule.clone(), &mut coverage)?;
+            progress(coverage.replays, total);
+        }
+        coverage.pairs_exhaustive = coverage.pairs_checked == plan.pairs.len();
+    }
+    eprintln!();
+
+    harness.shutdown();
+
+    let certificate = Certificate::new(
+        trace.id(),
+        trace.header.label.clone(),
+        config.names(),
+        coverage,
+        // Interleaving exploration needs the agent driven in-process; an
+        // external agent gets fault coverage only, and the certificate
+        // records the absence rather than implying it was checked.
+        Vec::new(),
+    );
+    finish(certificate, out, check)
+}
+
+/// A single rewriting line, so a sweep of a few hundred process launches
+/// does not look hung.
+fn progress(done: usize, total: usize) {
+    use std::io::Write;
+    let width = 24;
+    let filled = (done * width).checked_div(total).unwrap_or(0);
+    eprint!(
+        "\r  {} {done}/{total}",
+        ui::dim(&format!(
+            "[{}{}]",
+            "\u{2588}".repeat(filled),
+            " ".repeat(width - filled)
+        ))
+    );
+    let _ = std::io::stderr().flush();
+}
+
+fn finish(
+    certificate: Certificate,
+    out: Option<PathBuf>,
+    check: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
     report(&certificate);
 
     if let Some(path) = &out {

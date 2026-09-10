@@ -1,6 +1,7 @@
 //! `samsara` — deterministic replay and fault injection for LLM agents.
 
 mod bundle;
+mod config_file;
 mod demo;
 mod record;
 mod replay_cmd;
@@ -144,9 +145,20 @@ enum Command {
     /// there are no more to find, within stated bounds, and writes those
     /// bounds to a certificate you can commit and re-check in CI.
     Sweep {
-        /// Which worked example to sweep.
+        /// A recorded trace to sweep. Without one, sweeps a worked example.
+        trace: Option<PathBuf>,
+        /// Which worked example to sweep, when no trace is given.
         #[arg(long, value_enum, default_value_t = SweepSubject::Retry)]
         subject: SweepSubject,
+        /// Properties to enforce. Defaults to ./samsara.toml.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Port for the local endpoint when driving a real agent.
+        #[arg(long, default_value_t = 8789)]
+        port: u16,
+        /// The agent command, after `--`. Required when a trace is given.
+        #[arg(last = true)]
+        command: Vec<String>,
         /// Also check every pair of faults, not only every single one.
         #[arg(long)]
         pairs: bool,
@@ -163,6 +175,12 @@ enum Command {
         check: Option<PathBuf>,
     },
 
+    /// Write a starting samsara.toml.
+    Init {
+        #[arg(short, long, default_value = config_file::DEFAULT)]
+        out: PathBuf,
+    },
+
     /// Print a recorded trace.
     Show {
         /// Path to a `.samsara.jsonl` trace.
@@ -175,6 +193,10 @@ enum Command {
     /// Check a recorded trace against the built-in invariants.
     Verify {
         trace: PathBuf,
+        /// Properties to enforce. Defaults to ./samsara.toml, and takes
+        /// precedence over the flags below.
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Tools whose effects must not happen twice. Defaults to every tool.
         #[arg(long, value_delimiter = ',')]
         effectful: Vec<String>,
@@ -241,33 +263,55 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             &command,
         ),
         Command::Sweep {
+            trace,
             subject,
+            config,
+            port,
+            command,
             pairs,
             max_replays,
             out,
             check,
-        } => sweep_cmd::run(
-            match subject {
-                SweepSubject::Retry => sweep_cmd::Subject::Retry,
-                SweepSubject::Order => sweep_cmd::Subject::Order,
-                SweepSubject::Fixed => sweep_cmd::Subject::Fixed,
-            },
-            pairs,
-            max_replays,
-            out,
-            check,
-        ),
+        } => match trace {
+            Some(trace) => {
+                let config = config_file::load(config.as_deref())?;
+                sweep_cmd::run_external(sweep_cmd::External {
+                    trace: &trace,
+                    config: &config,
+                    pairs,
+                    max_replays,
+                    port,
+                    out,
+                    check,
+                    command: &command,
+                })
+            }
+            None => sweep_cmd::run(
+                match subject {
+                    SweepSubject::Retry => sweep_cmd::Subject::Retry,
+                    SweepSubject::Order => sweep_cmd::Subject::Order,
+                    SweepSubject::Fixed => sweep_cmd::Subject::Fixed,
+                },
+                pairs,
+                max_replays,
+                out,
+                check,
+            ),
+        },
+        Command::Init { out } => config_file::scaffold(&out),
         Command::Repro { seed, fixed } => demo::repro(seed, fixed),
         Command::Emit { out } => demo::emit(&out),
         Command::Show { trace, payloads } => show(&trace, payloads),
         Command::Verify {
             trace,
+            config,
             effectful,
             idempotency_key,
             max_effects,
             token_budget,
         } => verify(
             &trace,
+            config,
             effectful,
             idempotency_key,
             max_effects,
@@ -358,12 +402,44 @@ fn truncate(s: &str, max: usize) -> String {
 
 fn verify(
     path: &std::path::Path,
+    config: Option<PathBuf>,
     effectful: Vec<String>,
     idempotency_key: Option<String>,
     max_effects: usize,
     token_budget: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Properties are resolved before the trace is opened, so a broken
+    // config is reported as a broken config rather than being masked by
+    // whatever happens to be wrong with the path next to it.
+    //
+    // A declared config wins over the flags. They stay for one-off checks,
+    // but the point of the file is that every command enforces the same
+    // properties, and a flag quietly overriding it would defeat that.
+    let declared = match config.as_deref() {
+        Some(path) => Some(config_file::load(Some(path))?),
+        None if std::path::Path::new(config_file::DEFAULT).exists() => {
+            Some(config_file::load(None)?)
+        }
+        None => None,
+    };
+
     let (trace, cas) = load(path)?;
+
+    if let Some(declared) = declared {
+        let violations = check_all(&trace, &cas, &declared.build());
+        if violations.is_empty() {
+            ui::ok(&format!(
+                "{} effects, no violations, {} propert(ies) enforced",
+                trace.len(),
+                declared.invariants.len()
+            ));
+            return Ok(());
+        }
+        for v in &violations {
+            ui::bad(&v.report());
+        }
+        std::process::exit(1);
+    }
 
     let mut duplicates = if effectful.is_empty() {
         NoDuplicateEffects::all()
