@@ -1,0 +1,79 @@
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Only one deploy at a time, and let a newer push supersede an in-flight one.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+env:
+  # Must match the wasm-bindgen crate version in Cargo.lock. A mismatch
+  # produces bindings that fail at instantiation with an unhelpful error,
+  # so the build asserts they agree rather than trusting them to.
+  WASM_BINDGEN_VERSION: "0.2.128"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check the pinned CLI matches the crate
+        run: |
+          crate=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock \
+                  | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
+          if [ "$crate" != "$WASM_BINDGEN_VERSION" ]; then
+            echo "::error::Cargo.lock has wasm-bindgen $crate, workflow pins $WASM_BINDGEN_VERSION"
+            exit 1
+          fi
+
+      - name: Install wasm-bindgen-cli
+        run: |
+          url="https://github.com/rustwasm/wasm-bindgen/releases/download/${WASM_BINDGEN_VERSION}/wasm-bindgen-${WASM_BINDGEN_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -sSfL "$url" | tar xzf - --strip-components=1 -C /usr/local/bin \
+            "wasm-bindgen-${WASM_BINDGEN_VERSION}-x86_64-unknown-linux-musl/wasm-bindgen"
+          wasm-bindgen --version
+
+      - name: Build the engine for the browser
+        run: |
+          cargo build -p samsara-wasm --target wasm32-unknown-unknown --release
+          wasm-bindgen --target web --no-typescript --out-dir web/pkg \
+            target/wasm32-unknown-unknown/release/samsara_wasm.wasm
+
+      # A page that silently ships without its engine is worse than a failed
+      # build, because nobody notices until a stranger opens it.
+      - name: Check the bundle is complete
+        run: |
+          test -f web/index.html
+          test -f web/pkg/samsara_wasm.js
+          test -s web/pkg/samsara_wasm_bg.wasm
+          grep -q 'samsara_wasm.js' web/index.html
+          echo "wasm: $(du -h web/pkg/samsara_wasm_bg.wasm | cut -f1)"
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

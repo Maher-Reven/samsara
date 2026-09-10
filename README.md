@@ -6,6 +6,10 @@
 **Deterministic replay and fault injection for LLM agents.**
 Your agent failed once. Make it fail on demand.
 
+**[→ Break an agent in your browser](https://maher-reven.github.io/samsara/)** — the
+real engine compiled to WebAssembly. Click any effect to fault it and watch
+the two timelines diverge. No install, no API key, nothing sent anywhere.
+
 ---
 
 A tool call times out. The agent retries. But the first call *succeeded* — the
@@ -60,9 +64,8 @@ cargo run --bin samsara -- emit     # write demo traces to ./traces
 cargo run --bin samsara -- show traces/counterfactual.samsara.jsonl
 ```
 
-Or open the browser timeline — click any effect to break it and watch the two
-timelines diverge. It runs the real engine compiled to WebAssembly, so nothing
-in it is a mock-up:
+The [browser timeline](https://maher-reven.github.io/samsara/) runs the same
+engine. To build it locally:
 
 ```bash
 make web && python3 -m http.server -d web 8000
