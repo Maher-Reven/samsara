@@ -403,13 +403,15 @@ fn handle(
         Some("/ping") => json_response(200, json!({"ok": true})),
         Some("/begin") => {
             let incoming: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-            let effect = EffectRequest::tool(
-                incoming
+            let effect = EffectRequest {
+                kind: crate::record::effect_kind(&incoming),
+                name: incoming
                     .get("name")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("unknown"),
-                incoming.get("body").cloned().unwrap_or(Value::Null),
-            );
+                    .unwrap_or("unknown")
+                    .to_string(),
+                body: incoming.get("body").cloned().unwrap_or(Value::Null),
+            };
             let batch = incoming.get("batch").and_then(|v| v.as_u64());
             let (call, outcome) = perform_tool(shared, effect, batch);
             // Always `return`: during replay the real tool must never run.

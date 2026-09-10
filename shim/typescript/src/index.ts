@@ -120,6 +120,7 @@ export function wrapTool(name: string, tool: Tool): Tool {
     const batch = enterBatch();
     try {
       const decision: Decision = await post("/begin", {
+        kind: "tool",
         name,
         body: args ?? null,
         batch,
@@ -162,6 +163,69 @@ export function wrapTools<T extends Record<string, Tool>>(tools: T): T {
   return Object.fromEntries(
     Object.entries(tools).map(([name, tool]) => [name, wrapTool(name, tool)]),
   ) as T;
+}
+
+/**
+ * The current time in milliseconds, recorded as an effect.
+ *
+ * Use this instead of `Date.now()` anywhere the value influences what the
+ * agent does — above all in retry backoff. A clock read that Samsara cannot
+ * see is a source of non-determinism it cannot replay, and backoff jitter is
+ * the single most common one: the retry path is where idempotency bugs live,
+ * and a retry whose timing is uncontrolled is a retry you cannot reproduce.
+ *
+ * It is async because the value comes from the engine. That is a real cost
+ * and the reason this is opt-in rather than a global patch of `Date.now` —
+ * a testing tool that silently rewrites time for every library in the
+ * process is a worse bargain than an `await`.
+ *
+ * Falls through to the real clock when Samsara is not attached.
+ */
+export async function now(): Promise<number> {
+  if (!endpoint()) return Date.now();
+  return (await effect("clock", "now_ms", null, () => Date.now())) as number;
+}
+
+/**
+ * A uniform random draw in `[0, 1)`, recorded as an effect.
+ *
+ * Same reasoning as {@link now}: jitter that Samsara cannot see cannot be
+ * replayed. Falls through to `Math.random()` when not attached.
+ */
+export async function random(): Promise<number> {
+  if (!endpoint()) return Math.random();
+  return (await effect("random", "next_f64", null, () => Math.random())) as number;
+}
+
+/**
+ * The shared begin/end exchange, for any kind of effect.
+ *
+ * `produce` is what actually generates the value while recording. During
+ * replay it is never called, exactly as a tool is never called.
+ */
+async function effect(
+  kind: "clock" | "random" | "tool",
+  name: string,
+  body: unknown,
+  produce: () => unknown,
+): Promise<unknown> {
+  const batch = enterBatch();
+  try {
+    const decision: Decision = await post("/begin", { kind, name, body, batch });
+    if (decision.action === "return") {
+      return surface(decision.outcome);
+    }
+    let outcome: Outcome;
+    try {
+      outcome = { status: "ok", value: await produce() };
+    } catch (error) {
+      outcome = capture(error);
+    }
+    const { outcome: final } = await post("/end", { call: decision.call, outcome });
+    return surface(final);
+  } finally {
+    leaveBatch();
+  }
 }
 
 /** Whether Samsara is attached to this process. */

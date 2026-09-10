@@ -55,7 +55,12 @@ test("recording: the real tool runs and its result is reported", async () => {
   assert.equal(ran, 1, "the tool must actually run while recording");
   assert.deepEqual(result, { ok: true });
   assert.deepEqual(calls.map((c) => c.path), ["/begin", "/end"]);
-  assert.deepEqual(calls[0].body, { name: "delete_file", body: { path: "/x" }, batch: 1 });
+  assert.deepEqual(calls[0].body, {
+    kind: "tool",
+    name: "delete_file",
+    body: { path: "/x" },
+    batch: 1,
+  });
   assert.equal(calls[1].body.call, "c1", "the end must name the call it finishes");
   assert.deepEqual(calls[1].body.outcome, { status: "ok", value: { ok: true, path: "/x" } });
 });
@@ -242,4 +247,57 @@ test("a throwing tool still closes its batch", async () => {
 
   const batches = calls.filter((c) => c.path === "/begin").map((c) => c.body.batch);
   assert.notEqual(batches[0], batches[1], "the failed call released its slot");
+});
+
+// ---------------------------------------------------------------------------
+// Clock and randomness
+// ---------------------------------------------------------------------------
+
+const { now, random } = await import("../dist/index.js");
+
+test("the clock is recorded as an effect", async () => {
+  stub({
+    "/begin": { action: "execute", call: "c1" },
+    "/end": { outcome: { status: "ok", value: 1700000000000 } },
+  });
+
+  const t = await now();
+  assert.equal(t, 1700000000000, "the engine's value is what the agent sees");
+  assert.equal(calls[0].body.kind, "clock");
+  assert.equal(calls[0].body.name, "now_ms");
+  assert.equal(typeof calls[1].body.outcome.value, "number", "the real clock was reported");
+});
+
+test("replayed time comes from the recording, not the wall clock", async () => {
+  // The whole point. Backoff computed from an uncontrolled clock is a
+  // retry you cannot reproduce, and the retry path is where the bugs are.
+  stub({ "/begin": { action: "return", call: "c1", outcome: { status: "ok", value: 42 } } });
+  assert.equal(await now(), 42);
+  assert.deepEqual(calls.map((c) => c.path), ["/begin"], "no end: nothing was produced");
+});
+
+test("randomness is recorded and replayed the same way", async () => {
+  stub({ "/begin": { action: "return", call: "c1", outcome: { status: "ok", value: 0.25 } } });
+  assert.equal(await random(), 0.25);
+  assert.equal(calls[0].body.kind, "random");
+});
+
+test("detached, both fall through to the real thing", async () => {
+  const saved = process.env.SAMSARA_ENDPOINT;
+  delete process.env.SAMSARA_ENDPOINT;
+  const fresh = await import(`../dist/index.js?clock=${Date.now()}`);
+
+  const before = Date.now();
+  const t = await fresh.now();
+  assert.ok(t >= before, "a real timestamp");
+  const r = await fresh.random();
+  assert.ok(r >= 0 && r < 1, "a real draw");
+
+  process.env.SAMSARA_ENDPOINT = saved;
+});
+
+test("tool calls still declare their kind", async () => {
+  stub({ "/begin": { action: "return", call: "c1", outcome: { status: "ok", value: 1 } } });
+  await wrapTool("t", async () => "live")({});
+  assert.equal(calls[0].body.kind, "tool");
 });

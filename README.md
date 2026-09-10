@@ -99,6 +99,21 @@ only says whether it can be made to do something it must never do.
 | **An agent that talks HTTP to a provider** | any language. The proxy is the configured base URL, so there is no SDK to swap. |
 | **Nothing else** | no API key, no account, no network after recording once. |
 
+### Is it generic?
+
+The model side is: the proxy *is* the configured base URL, so any language
+and any SDK that reads `ANTHROPIC_BASE_URL` is captured with no code change.
+
+Everything else depends on what you route through the shim. Samsara can only
+see effects it is told about, so an agent that reads a database, a file or the
+system clock outside a wrapped call has non-determinism Samsara cannot replay
+or perturb. In practice that means wrapping the tools that matter and using
+`now()` / `random()` in your retry logic — not a rewrite, but not nothing.
+
+**Samsara is not an eval harness.** Evals ask whether the answer was good;
+this asks whether the agent can be made to do something it must never do.
+Different axis, and you probably want both.
+
 Model calls work with any language today. **Tool calls need a shim, and only
 TypeScript has one** — a Python port is an afternoon, because the shim carries
 no logic, but it does not exist yet. Without a shim you still get model-call
@@ -408,6 +423,31 @@ The last two are the ones people forget, and they are exactly the ones that
 matter. Retry backoff is a jittered sleep computed from a clock reading and a
 random draw. Leave those uncontrolled and the retry bug — the whole reason you
 are here — is unreproducible.
+
+Model calls are captured with no code change. The other three you route
+through the shim:
+
+```ts
+import { wrapTools, now, random } from "@samsara/shim";
+
+const tools = wrapTools({ charge_card: async (a) => billing.charge(a) });
+
+// in your retry loop
+const jitter = await random();
+const wakeAt = (await now()) + base * jitter;
+```
+
+`now()` and `random()` are async because the value comes from the engine, and
+they are opt-in rather than a global patch of `Date.now`: a testing tool that
+silently rewrites time for every library in your process is a worse bargain
+than an `await`. Both fall through to the real thing when Samsara is not
+attached.
+
+**A clock read you do not route is invisible**, and invisible non-determinism
+is the one thing replay cannot paper over. If your backoff uses bare
+`Date.now()`, replay still works — the effects all match — but the *timing* is
+whatever the wall clock says, so a bug that depends on it will not reproduce
+reliably.
 
 ### The four pieces
 

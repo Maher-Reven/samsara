@@ -224,6 +224,21 @@ pub(crate) fn json_response(
         )
 }
 
+/// Which kind of effect the shim is reporting.
+///
+/// Defaults to `tool` so a shim that predates clock and randomness support
+/// keeps working unchanged. Clock and random reads are effects like any
+/// other: unrecorded, they are non-determinism replay cannot reproduce, and
+/// backoff jitter is the one that matters because the retry path is where
+/// idempotency bugs live.
+pub(crate) fn effect_kind(incoming: &Value) -> EffectKind {
+    match incoming.get("kind").and_then(|v| v.as_str()) {
+        Some("clock") => EffectKind::Clock,
+        Some("random") => EffectKind::Random,
+        _ => EffectKind::Tool,
+    }
+}
+
 /// The tool-side protocol.
 fn tool_protocol(
     path: &str,
@@ -236,7 +251,7 @@ fn tool_protocol(
         "/begin" => {
             let incoming: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
             let request = EffectRequest {
-                kind: EffectKind::Tool,
+                kind: effect_kind(&incoming),
                 name: incoming
                     .get("name")
                     .and_then(|v| v.as_str())
