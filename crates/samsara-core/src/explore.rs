@@ -170,7 +170,7 @@ impl OrderDependence {
 /// flagging it would report a difference on every well-behaved agent. What
 /// matters is whether anything *downstream* changed. So each batch collapses
 /// to a sorted multiset, and everything outside a batch keeps its position.
-fn behaviour(trace: &Trace) -> Vec<String> {
+pub fn behaviour(trace: &Trace) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut pending: Vec<String> = Vec::new();
     let mut current: Option<u64> = None;
@@ -609,7 +609,25 @@ impl Interleavings {
 /// 7! is 5040 replays, which is about a second. 8! is eight times that and
 /// the returns stop justifying it; beyond this the check reports a sample
 /// and says so rather than quietly pretending.
-const EXHAUSTIVE_WIDTH: usize = 7;
+pub const EXHAUSTIVE_WIDTH: usize = 7;
+
+/// The concurrent batches in a recording: `(id, first position, width)`.
+///
+/// Shared by the in-process explorer and the out-of-process one, for the
+/// same reason schedule enumeration is: two definitions of "every ordering"
+/// that could disagree would be two definitions of exhaustive.
+pub fn batches(trace: &Trace) -> Vec<(u64, u64, usize)> {
+    let mut found: Vec<(u64, u64, usize)> = Vec::new();
+    for event in &trace.events {
+        if let Some(batch) = event.batch {
+            match found.iter_mut().find(|(b, _, _)| *b == batch) {
+                Some((_, _, width)) => *width += 1,
+                None => found.push((batch, event.seq, 1)),
+            }
+        }
+    }
+    found
+}
 
 /// Check a concurrent batch against **every** ordering.
 ///
@@ -715,7 +733,7 @@ where
 }
 
 /// All permutations of `0..n`, in a deterministic order.
-fn permutations(n: usize) -> Vec<Vec<usize>> {
+pub fn permutations(n: usize) -> Vec<Vec<usize>> {
     let mut out = Vec::new();
     let mut current: Vec<usize> = (0..n).collect();
     heap(&mut current, n, &mut out);

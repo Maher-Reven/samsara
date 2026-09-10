@@ -707,6 +707,9 @@ Stated plainly, because a README that only lists strengths is not worth reading:
   — is out of reach.
 - **Streaming responses are recorded whole.** Chunk boundaries are not
   preserved, so mid-stream truncation faults are unavailable for model calls.
+- **A wide batch is sampled, not enumerated.** Beyond seven concurrent calls
+  the ordering space is 5040 runs and the check reports a sample, saying so
+  rather than implying completeness.
 - **The batch barrier waits, bounded.** To reorder concurrent calls the proxy
   must hold early arrivals until the rest of their burst appears — but a
   counterfactual agent may have diverged and may never issue them. So the wait

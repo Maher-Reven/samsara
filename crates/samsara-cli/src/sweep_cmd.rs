@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-use samsara_core::explore::plan;
+use samsara_core::explore::{batches, behaviour, permutations, plan, EXHAUSTIVE_WIDTH};
 use samsara_core::prelude::*;
 use samsara_core::testkit::{run_agent, run_assembler, Assembly, FakeBackend, Style};
 
@@ -105,7 +105,7 @@ pub fn run_external(options: External<'_>) -> Result<(), Box<dyn std::error::Err
             String::new()
         },
         total,
-        command.join(" ")
+        summarise_command(command)
     ));
 
     let mut coverage = Coverage::starting(&plan);
@@ -150,6 +150,8 @@ pub fn run_external(options: External<'_>) -> Result<(), Box<dyn std::error::Err
     }
     eprintln!();
 
+    // Orderings, for any batch the recording captured.
+    let orders = external_interleavings(&harness, command, &mut budget)?;
     harness.shutdown();
 
     let certificate = Certificate::new(
@@ -157,12 +159,124 @@ pub fn run_external(options: External<'_>) -> Result<(), Box<dyn std::error::Err
         trace.header.label.clone(),
         config.names(),
         coverage,
-        // Interleaving exploration needs the agent driven in-process; an
-        // external agent gets fault coverage only, and the certificate
-        // records the absence rather than implying it was checked.
-        Vec::new(),
+        orders,
     );
     finish(certificate, out, check)
+}
+
+/// Check every ordering of every concurrent batch, against a real agent.
+///
+/// The same exhaustive check the in-process explorer does, paid for one
+/// process launch at a time. It runs after the fault sweep and out of the
+/// same budget, so a trace with a wide batch cannot silently consume an
+/// afternoon.
+fn external_interleavings(
+    harness: &crate::replay_cmd::Harness,
+    command: &[String],
+    budget: &mut usize,
+) -> Result<Vec<Interleavings>, Box<dyn std::error::Error>> {
+    let trace = harness.trace();
+    let found = batches(trace);
+    if found.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let run = |schedule: FaultSchedule| -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let (result, _) = harness.run_once(Mode::Counterfactual { schedule }, command)?;
+        Ok(behaviour(&result.branch))
+    };
+
+    let baseline = run(FaultSchedule::empty())?;
+    *budget = budget.saturating_sub(1);
+
+    let mut reports = Vec::new();
+    for (batch, at_seq, width) in found {
+        let total = (1..=width).product::<usize>();
+        let exhaustive = width <= EXHAUSTIVE_WIDTH;
+        let orders = if exhaustive {
+            permutations(width)
+        } else {
+            (0..64u64)
+                .filter_map(|seed| Fault::Reorder { seed }.permutation(width))
+                .collect()
+        };
+
+        let mut checked = 1; // the recorded ordering
+        let mut divergent = Vec::new();
+        let mut ran_all = exhaustive;
+
+        for order in orders {
+            if order.iter().enumerate().all(|(i, &j)| i == j) {
+                continue;
+            }
+            if *budget == 0 {
+                // Out of budget mid-batch. Say so rather than reporting a
+                // partial sweep as though every ordering had run.
+                ran_all = false;
+                break;
+            }
+            *budget -= 1;
+            let schedule = FaultSchedule::of(vec![FaultPoint {
+                seq: at_seq,
+                fault: Fault::Exact {
+                    order: order.clone(),
+                },
+            }]);
+            checked += 1;
+            if run(schedule)? != baseline {
+                divergent.push(order);
+            }
+        }
+
+        // Which adjacent pairs commute: the diagnostic that says *which* two
+        // calls are entangled rather than only that something is.
+        let mut commuting = 0;
+        let mut adjacent = 0;
+        for i in 0..width.saturating_sub(1) {
+            if *budget == 0 {
+                break;
+            }
+            *budget -= 1;
+            adjacent += 1;
+            let mut order: Vec<usize> = (0..width).collect();
+            order.swap(i, i + 1);
+            let schedule = FaultSchedule::of(vec![FaultPoint {
+                seq: at_seq,
+                fault: Fault::Exact { order },
+            }]);
+            if run(schedule)? == baseline {
+                commuting += 1;
+            }
+        }
+
+        reports.push(Interleavings {
+            batch,
+            width,
+            total,
+            checked,
+            exhaustive: ran_all,
+            commuting_pairs: commuting,
+            adjacent_pairs: adjacent,
+            divergent,
+            replays: checked - 1 + adjacent,
+        });
+    }
+    Ok(reports)
+}
+
+/// A one-line rendering of the agent command.
+///
+/// Agents are often launched through a shell with an inline script, so the
+/// raw command can be dozens of lines and will happily destroy the report it
+/// is printed in.
+fn summarise_command(command: &[String]) -> String {
+    let flat = command.join(" ").replace(['\n', '\r'], " ");
+    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= 48 {
+        return flat;
+    }
+    let head: String = flat.chars().take(47).collect();
+    format!("{head}\u{2026}")
 }
 
 /// A single rewriting line, so a sweep of a few hundred process launches
@@ -360,4 +474,27 @@ fn compare(current: &Certificate, path: &Path) -> Result<(), Box<dyn std::error:
     // Non-zero so this works as a CI gate. Coverage that quietly shrinks is
     // the regression worth catching, and it does not change the verdict.
     std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summarise_command;
+
+    #[test]
+    fn a_multiline_command_stays_on_one_line() {
+        let command = vec![
+            "sh".into(),
+            "-c".into(),
+            "set -u\ncurl ...\ncall charge_card\n".into(),
+        ];
+        let shown = summarise_command(&command);
+        assert!(!shown.contains('\n'), "{shown}");
+        assert!(shown.chars().count() <= 48, "{shown}");
+    }
+
+    #[test]
+    fn a_short_command_is_left_alone() {
+        let command = vec!["npm".into(), "start".into()];
+        assert_eq!(summarise_command(&command), "npm start");
+    }
 }

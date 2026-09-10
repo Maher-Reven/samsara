@@ -59,8 +59,8 @@ pub mod prelude {
     pub use crate::config::{Config, InvariantSpec};
     pub use crate::event::{EffectKind, EffectRequest, Event, Outcome};
     pub use crate::explore::{
-        evaluate, interleavings, minimise, plan, search, search_order_dependence, sweep, Case,
-        Coverage, Finding, Interleavings, OrderDependence,
+        batches, behaviour, evaluate, interleavings, minimise, permutations, plan, search,
+        search_order_dependence, sweep, Case, Coverage, Finding, Interleavings, OrderDependence,
     };
     pub use crate::fault::{Fault, FaultPoint, FaultSchedule};
     pub use crate::hash::Digest;

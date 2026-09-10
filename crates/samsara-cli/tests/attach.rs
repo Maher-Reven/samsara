@@ -838,3 +838,55 @@ curl -sS -X POST "$SAMSARA_ENDPOINT/begin" \
         "it must actually give up, took {elapsed:?}"
     );
 }
+
+#[test]
+fn a_sweep_of_a_real_agent_covers_every_ordering_too() {
+    // Until this existed, an external sweep reported fault coverage and no
+    // interleaving coverage at all -- the engine could explore orderings,
+    // the out-of-process driver could not reach it.
+    let dir = scratch("external-orderings");
+    let upstream = Upstream::start();
+    let trace_path = record(&dir, &upstream, CONCURRENT_AGENT);
+    let cert = dir.join("cert.json");
+
+    let config = dir.join("samsara.toml");
+    std::fs::write(
+        &config,
+        "[[invariant]]\ntype = \"terminates_within\"\neffects = 40\n",
+    )
+    .unwrap();
+
+    let out = samsara()
+        .arg("sweep")
+        .arg(&trace_path)
+        .args(["--port", &free_port().to_string()])
+        .arg("--config")
+        .arg(&config)
+        .arg("--out")
+        .arg(&cert)
+        .arg("--")
+        .args(["sh", "-c", CONCURRENT_AGENT])
+        .env("SIDE_EFFECT_LOG", dir.join("side-effects.log"))
+        .env_remove("SAMSARA_UPSTREAM")
+        .output()
+        .expect("sweep runs");
+
+    assert!(
+        out.status.success(),
+        "sweep failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&cert).unwrap()).unwrap();
+    let orders = parsed["interleavings"]
+        .as_array()
+        .expect("interleavings array");
+
+    assert_eq!(orders.len(), 1, "one concurrent batch: {parsed}");
+    assert_eq!(orders[0]["width"], 3);
+    assert_eq!(orders[0]["total"], 6, "3! orderings");
+    assert_eq!(orders[0]["exhaustive"], true, "all of them ran");
+    assert_eq!(orders[0]["checked"], 6);
+}
