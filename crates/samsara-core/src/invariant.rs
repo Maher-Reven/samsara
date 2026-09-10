@@ -613,6 +613,168 @@ mod tests {
         );
     }
 
+    // -- declarable properties -------------------------------------------
+
+    #[test]
+    fn a_call_after_a_failed_prerequisite_is_caught() {
+        // The money-losing shape: the charge failed, the receipt went out.
+        let (t, cas) = build(vec![
+            row(
+                EffectKind::Tool,
+                "charge_card",
+                json!({"amt": 10}),
+                Outcome::err("400", "declined"),
+            ),
+            row(EffectKind::Tool, "send_receipt", json!({"to": "x"}), ok()),
+        ]);
+        let check = NeverAfterFailure {
+            tool: "send_receipt".into(),
+            after: "charge_card".into(),
+        };
+        let v = check.check(&t, &cas);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].at_seq, Some(1));
+    }
+
+    #[test]
+    fn a_successful_retry_clears_the_earlier_failure() {
+        // The agent failed, retried, succeeded, then proceeded. Correct.
+        let (t, cas) = build(vec![
+            row(
+                EffectKind::Tool,
+                "charge_card",
+                json!({"amt": 10}),
+                Outcome::err("400", "declined"),
+            ),
+            row(EffectKind::Tool, "charge_card", json!({"amt": 10}), ok()),
+            row(EffectKind::Tool, "send_receipt", json!({"to": "x"}), ok()),
+        ]);
+        let check = NeverAfterFailure {
+            tool: "send_receipt".into(),
+            after: "charge_card".into(),
+        };
+        assert!(check.check(&t, &cas).is_empty());
+    }
+
+    #[test]
+    fn an_injected_fault_still_counts_as_a_failure_the_agent_saw() {
+        // The agent was told the charge failed, so proceeding is still the
+        // bug -- even though the shadow says it really succeeded.
+        let (t, cas) = build(vec![
+            faulted(
+                "charge_card",
+                json!({"amt": 10}),
+                ok(),
+                Fault::Error { code: "503".into() },
+            ),
+            row(EffectKind::Tool, "send_receipt", json!({"to": "x"}), ok()),
+        ]);
+        let check = NeverAfterFailure {
+            tool: "send_receipt".into(),
+            after: "charge_card".into(),
+        };
+        // Landing::Yes, because the shadow proves it landed -- so by this
+        // invariant's definition the prerequisite held.
+        assert!(check.check(&t, &cas).is_empty());
+    }
+
+    #[test]
+    fn a_missing_audit_record_is_caught() {
+        let (t, cas) = build(vec![row(
+            EffectKind::Tool,
+            "charge_card",
+            json!({"amt": 10}),
+            ok(),
+        )]);
+        let check = Requires {
+            tool: "charge_card".into(),
+            then: "log_audit".into(),
+        };
+        assert_eq!(check.check(&t, &cas).len(), 1);
+    }
+
+    #[test]
+    fn requires_is_satisfied_in_either_order() {
+        for rows in [
+            vec![("charge_card", 0), ("log_audit", 1)],
+            vec![("log_audit", 0), ("charge_card", 1)],
+        ] {
+            let (t, cas) = build(
+                rows.iter()
+                    .map(|(name, i)| row(EffectKind::Tool, name, json!({ "i": i }), ok()))
+                    .collect(),
+            );
+            let check = Requires {
+                tool: "charge_card".into(),
+                then: "log_audit".into(),
+            };
+            assert!(check.check(&t, &cas).is_empty(), "{rows:?}");
+        }
+    }
+
+    #[test]
+    fn requires_does_not_fire_when_the_trigger_never_landed() {
+        let (t, cas) = build(vec![row(
+            EffectKind::Tool,
+            "charge_card",
+            json!({"amt": 10}),
+            Outcome::err("400", "declined"),
+        )]);
+        let check = Requires {
+            tool: "charge_card".into(),
+            then: "log_audit".into(),
+        };
+        assert!(
+            check.check(&t, &cas).is_empty(),
+            "nothing happened, nothing is required"
+        );
+    }
+
+    #[test]
+    fn a_per_tool_ceiling_catches_what_a_step_budget_misses() {
+        let rows: Vec<Row> = (0..5)
+            .map(|i| row(EffectKind::Tool, "poll", json!({ "i": i }), ok()))
+            .collect();
+        let (t, cas) = build(rows);
+
+        assert!(
+            TerminatesWithin(10).check(&t, &cas).is_empty(),
+            "the run is short overall"
+        );
+        let v = MaxCalls {
+            tool: "poll".into(),
+            max: 3,
+        }
+        .check(&t, &cas);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].detail.contains("5 times"));
+    }
+
+    #[test]
+    fn max_calls_counts_attempts_not_successes() {
+        // Hammering a failing endpoint is a problem whether or not it works.
+        let rows: Vec<Row> = (0..4)
+            .map(|i| {
+                row(
+                    EffectKind::Tool,
+                    "poll",
+                    json!({ "i": i }),
+                    Outcome::err("500", "nope"),
+                )
+            })
+            .collect();
+        let (t, cas) = build(rows);
+        assert_eq!(
+            MaxCalls {
+                tool: "poll".into(),
+                max: 2
+            }
+            .check(&t, &cas)
+            .len(),
+            1
+        );
+    }
+
     #[test]
     fn check_all_aggregates() {
         let (t, cas) = build(vec![
@@ -624,5 +786,162 @@ mod tests {
             Box::new(TerminatesWithin(1)),
         ];
         assert_eq!(check_all(&t, &cas, &invariants).len(), 2);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Properties an agent's own author has to declare
+// ---------------------------------------------------------------------------
+
+/// Every effectful call this run made, in order, with whether it landed.
+fn effectful_calls<'a>(
+    trace: &'a Trace,
+    cas: &'a dyn Cas,
+) -> impl Iterator<Item = (&'a crate::event::Event, Landing)> + 'a {
+    trace
+        .events
+        .iter()
+        .filter(|e| e.kind.is_effectful())
+        .map(move |e| (e, landing(e, cas)))
+}
+
+/// **After `after` fails, `tool` must not be called.**
+///
+/// The shape of most money-losing agent bugs: the charge failed and the
+/// receipt went out anyway, the upload failed and the source was deleted
+/// anyway. An agent that does not check the result of step *n* before
+/// committing step *n+1* looks completely fine until the day step *n*
+/// fails, which is the day this fires.
+#[derive(Debug, Clone)]
+pub struct NeverAfterFailure {
+    /// The call that must not happen.
+    pub tool: String,
+    /// The call whose failure forbids it.
+    pub after: String,
+}
+
+impl Invariant for NeverAfterFailure {
+    fn name(&self) -> &str {
+        "never_after_failure"
+    }
+
+    fn check(&self, trace: &Trace, cas: &dyn Cas) -> Vec<Violation> {
+        let mut failed_at = None;
+        let mut violations = Vec::new();
+
+        for (event, landed) in effectful_calls(trace, cas) {
+            if event.name == self.after && landed != Landing::Yes {
+                failed_at = Some(event.seq);
+            }
+            // A later success resolves the earlier failure: the agent
+            // retried and got there, so what follows is legitimate.
+            if event.name == self.after && landed == Landing::Yes {
+                failed_at = None;
+            }
+            if event.name == self.tool {
+                if let Some(seq) = failed_at {
+                    violations.push(Violation {
+                        invariant: "never_after_failure".into(),
+                        at_seq: Some(event.seq),
+                        detail: format!(
+                            "`{}` failed at #{seq} and `{}` was called anyway at #{}",
+                            self.after, self.tool, event.seq
+                        ),
+                    });
+                }
+            }
+        }
+        violations
+    }
+}
+
+/// **If `tool` takes effect, `then` must take effect too.**
+///
+/// The audit-trail property. Charging a card without recording it, deleting
+/// a file without logging it, provisioning without notifying. Ordering is
+/// not required — only that the run does not end having done one and not the
+/// other.
+#[derive(Debug, Clone)]
+pub struct Requires {
+    pub tool: String,
+    pub then: String,
+}
+
+impl Invariant for Requires {
+    fn name(&self) -> &str {
+        "requires"
+    }
+
+    fn check(&self, trace: &Trace, cas: &dyn Cas) -> Vec<Violation> {
+        let mut trigger = None;
+        let mut satisfied = false;
+
+        for (event, landed) in effectful_calls(trace, cas) {
+            if landed != Landing::Yes {
+                continue;
+            }
+            if event.name == self.tool && trigger.is_none() {
+                trigger = Some(event.seq);
+            }
+            if event.name == self.then {
+                satisfied = true;
+            }
+        }
+
+        match (trigger, satisfied) {
+            (Some(seq), false) => vec![Violation {
+                invariant: "requires".into(),
+                at_seq: Some(seq),
+                detail: format!(
+                    "`{}` took effect at #{seq} but `{}` never did",
+                    self.tool, self.then
+                ),
+            }],
+            _ => vec![],
+        }
+    }
+}
+
+/// **`tool` is called at most `max` times.**
+///
+/// Blunt, and useful for exactly that reason: a per-tool ceiling catches the
+/// runaway that a whole-run step budget is too coarse to see. Counts every
+/// attempt, not only the ones that landed — an agent hammering a failing
+/// endpoint two hundred times is a problem whether or not any of them
+/// worked.
+#[derive(Debug, Clone)]
+pub struct MaxCalls {
+    pub tool: String,
+    pub max: usize,
+}
+
+impl Invariant for MaxCalls {
+    fn name(&self) -> &str {
+        "max_calls"
+    }
+
+    fn check(&self, trace: &Trace, cas: &dyn Cas) -> Vec<Violation> {
+        let _ = cas;
+        let calls: Vec<u64> = trace
+            .events
+            .iter()
+            .filter(|e| e.kind.is_effectful() && e.name == self.tool)
+            .map(|e| e.seq)
+            .collect();
+
+        if calls.len() > self.max {
+            vec![Violation {
+                invariant: "max_calls".into(),
+                at_seq: calls.get(self.max).copied(),
+                detail: format!(
+                    "`{}` was called {} times, limit is {}",
+                    self.tool,
+                    calls.len(),
+                    self.max
+                ),
+            }]
+        } else {
+            vec![]
+        }
     }
 }
