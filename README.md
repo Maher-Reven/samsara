@@ -95,6 +95,68 @@ times and hoping, every ordering runs:
   • 0 of 2 adjacent pairs commute
 ```
 
+### Declare what must never happen
+
+Fault injection only means something if something is watching. The other
+tools in this space inject and rely on *your* test suite to notice — which
+finds crashes and misses everything an agent does wrong while staying up.
+
+Samsara watches. But what counts as wrong is not something a library can
+know: `delete_file` twice is an incident, `search` twice is a waste, and only
+the person who wrote the agent can say which of their tools is which. So the
+properties are declared in a file that every command reads.
+
+```toml
+# samsara.toml
+[[invariant]]
+type = "no_duplicate_effects"
+tools = ["charge_card", "send_email"]
+idempotency_key = "idempotency_key"
+
+[[invariant]]
+type = "never_after_failure"    # the receipt must not go out
+tool = "send_receipt"           # if the charge failed
+after = "charge_card"
+
+[[invariant]]
+type = "requires"               # nothing is charged without an audit record
+tool = "charge_card"
+then = "log_audit"
+
+[[invariant]]
+type = "max_calls"              # a per-tool ceiling, for the runaway a
+tool = "search"                 # whole-run budget is too coarse to see
+max = 20
+```
+
+`samsara init` writes a starting point. A typo is an error rather than a
+silently ignored line, because believing you enforce a property you do not is
+the worst outcome available.
+
+Then point it at your own agent:
+
+```bash
+samsara sweep run.samsara.jsonl --pairs -- npm start
+```
+
+```
+1. What was checked
+  • 3 faultable positions × 5 fault kinds
+  • 15 single-fault schedules (all of them)
+  • 75 pair schedules (all of them)
+
+2. What it means
+  ✗ 2 of 15 single faults break it; 20 pairs do, across all 75
+
+3. Failing schedules
+     #1 timeout
+       [no_duplicate_effects] `charge_card` took effect at #1 and again
+       at #2 with identical arguments — the side effect happened twice
+```
+
+Every schedule is a real launch of your agent against replayed responses. No
+tokens, no network — the expense is `fork`, not the model.
+
 ### The certificate
 
 A claim about coverage is worth nothing if nobody can check it, so `sweep`
@@ -405,10 +467,10 @@ position stays well defined after the fork, and says what you actually mean:
 ```
 crates/samsara-core    engine: trace, CAS, canonicalisation, replay, faults,
                        shrinking, invariants, batch scheduling, exhaustive
-                       coverage, certificates  (85 tests)
-crates/samsara-cli     the `samsara` binary: record, replay, sweep, verify,
-                       and end-to-end tests driving it against a stub
-                       provider  (20 tests)
+                       coverage, certificates, declared properties
+crates/samsara-cli     the `samsara` binary: init, record, replay, sweep,
+                       verify, and end-to-end tests driving it against a
+                       stub provider
 certificates/          committed coverage claims, re-checked by CI
 crates/samsara-wasm    WebAssembly bindings for the timeline
 shim/typescript        the tool-side shim  (12 tests)
@@ -442,6 +504,11 @@ Three things I could not find anywhere:
 
 1. **Exhaustive bounded coverage** — enumerating the whole single-fault space
    and saying so, rather than sampling it. Everything above searches randomly.
+   Paired with declared properties, the claim becomes one nothing else in this
+   space can make: *you say what must never happen, and Samsara reports
+   whether any single fault can cause it.* The injectors have no assertions;
+   the observability platforms do not inject; the cassette libraries do not
+   search. This needs all three.
 2. **The landing model and shadow outcome** — the retry/idempotency problem is
    widely recognised, but asserting a duplicate side effect *with certainty*,
    by recording the outcome a fault suppressed, is not something I found.
