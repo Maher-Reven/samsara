@@ -6,6 +6,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Exposes the deterministic fake world and the agent under test, so other
+# crates in the workspace (and downstream users writing their own agents)
+# can build against the same harness the property tests use.
+testkit = []
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
