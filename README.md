@@ -119,6 +119,12 @@ what you get back:
 did, under conditions you choose.** Those are different axes, and a serious
 agent wants both.
 
+To be unambiguous about one thing: Samsara does not check your evals, run
+them, or know they exist. Both tools point at the agent, from different
+sides. An agent can score full marks on every eval you own and still charge a
+card twice under a timeout — the two measure unrelated properties and can
+disagree completely while both being right.
+
 ### What you need
 
 | | |
