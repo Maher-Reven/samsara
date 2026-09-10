@@ -27,6 +27,8 @@ pub struct World {
     /// Every delete that actually mutated state, in order. The ground truth
     /// the whole project exists to protect.
     pub deletes: Vec<String>,
+    /// Documents saved, most recent last.
+    pub saved: Vec<String>,
     /// Idempotency keys already honoured.
     applied: HashSet<String>,
 }
@@ -94,6 +96,7 @@ impl FakeBackend {
                 "tool": "delete_file",
                 "arguments": {"path": "/var/reports/stale.csv"}
             }),
+            "plan_sections" => json!({"sections": ["intro", "summary", "appendix"]}),
             _ => json!({"text": "Done. Removed the stale report."}),
         };
         Outcome::ok(json!({
@@ -145,6 +148,18 @@ impl FakeBackend {
 
                 self.world.deletes.push(path.to_string());
                 Outcome::ok(json!({"ok": true, "path": path}))
+            }
+            "render_section" => {
+                let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                Outcome::ok(json!({"name": name, "text": format!("<{name}>")}))
+            }
+            "save_document" => {
+                let content = args
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                self.world.saved.push(content.to_string());
+                Outcome::ok(json!({"saved": true, "bytes": content.len()}))
             }
             other => Outcome::err("unknown_tool", format!("no such tool: {other}")),
         }
@@ -274,4 +289,84 @@ pub fn run_agent<E: Effects>(fx: &mut E, style: Style) -> Report {
         attempts,
         succeeded,
     }
+}
+
+// ---------------------------------------------------------------------------
+// A concurrent agent
+// ---------------------------------------------------------------------------
+
+/// How the assembling agent handles results from concurrent calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Assembly {
+    /// Folds each result into the document as it arrives. This is how
+    /// concurrent work is usually written — a loop over completions, or an
+    /// `on_result` callback — and it makes the output depend on a race.
+    AsTheyArrive,
+    /// Places each result at the index it was requested from, so the
+    /// document is the same whatever order the calls finish in.
+    ByRequestOrder,
+}
+
+/// An agent that renders several document sections concurrently.
+///
+/// The bug is quiet: every call succeeds, nothing errors, no invariant about
+/// duplicates or budgets fires. The document is simply assembled in the wrong
+/// order, and only sometimes. In production it looks like an intermittent
+/// formatting glitch that nobody can reproduce.
+pub fn run_assembler<E: Effects>(fx: &mut E, assembly: Assembly) -> Vec<String> {
+    let plan = fx.perform(EffectRequest::model(
+        "claude-sonnet-4",
+        json!({"step": "plan_sections", "task": "assemble the report"}),
+    ));
+
+    let sections: Vec<String> = plan
+        .value()
+        .and_then(|v| v.pointer("/content/sections"))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_else(|| vec!["intro".into(), "summary".into()]);
+
+    // Issued together, as an agent does when the model returns several tool
+    // calls in one turn.
+    let requests: Vec<EffectRequest> = sections
+        .iter()
+        .map(|name| EffectRequest::tool("render_section", json!({"name": name})))
+        .collect();
+
+    let results = fx.perform_batch(requests);
+
+    let mut document: Vec<String> = match assembly {
+        Assembly::AsTheyArrive => results
+            .iter()
+            .filter_map(|(_, outcome)| text_of(outcome))
+            .collect(),
+        Assembly::ByRequestOrder => {
+            let mut slots: Vec<(usize, String)> = results
+                .iter()
+                .filter_map(|(i, outcome)| text_of(outcome).map(|t| (*i, t)))
+                .collect();
+            slots.sort_by_key(|(i, _)| *i);
+            slots.into_iter().map(|(_, t)| t).collect()
+        }
+    };
+    document.retain(|s| !s.is_empty());
+
+    fx.perform(EffectRequest::tool(
+        "save_document",
+        json!({"content": document.join("\n")}),
+    ));
+
+    document
+}
+
+fn text_of(outcome: &Outcome) -> Option<String> {
+    outcome
+        .value()
+        .and_then(|v| v.get("text"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
