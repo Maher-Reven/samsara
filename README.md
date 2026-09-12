@@ -68,6 +68,9 @@ $ samsara demo          # no API key, no network, no cost
 [What it does not do yet](#what-it-does-not-do-yet)
 
 **How it works:** [The idea](#the-idea) ·
+[Architecture](#the-four-pieces) ·
+[Canonicalisation](#canonicalisation-why-byte-equality-fails) ·
+[Delta debugging](#how-shrinking-works-ddmin) ·
 [Exhaustive coverage](#the-part-that-is-actually-different) ·
 [Concurrency](#concurrent-tool-calls) ·
 [Is replay faithful?](#is-replay-actually-faithful) ·
@@ -390,6 +393,15 @@ max = 20
 silently ignored line, because believing you enforce a property you do not is
 the worst outcome available.
 
+| Invariant | Parameters in `samsara.toml` | What it guards |
+|---|---|---|
+| `no_duplicate_effects` | `tools = [...]`, `idempotency_key = "..."` | Prevents side-effecting tools from executing twice across retries |
+| `never_after_failure` | `tool = "..."`, `after = "..."` | Forbids sensitive actions if an earlier prerequisite step failed |
+| `requires` | `tool = "..."`, `then = "..."` | Demands a companion action (e.g. audit log) whenever an effect lands |
+| `max_calls` | `tool = "..."`, `max = N` | Per-tool rate ceiling, catching runaways a whole-run budget is too coarse to see |
+| `terminates_within` | `effects = N` | Caps total steps, catching infinite retry loops |
+| `token_budget` | `tokens = N` | Enforces an upper bound on model token consumption |
+
 Then point it at your own agent:
 
 ```bash
@@ -519,7 +531,57 @@ is the one thing replay cannot paper over. If your backoff uses bare
 whatever the wall clock says, so a bug that depends on it will not reproduce
 reliably.
 
+**Zero OS entropy is a compile-time guarantee.** Samsara builds `rand` with
+`default-features = false` to deliberately drop `getrandom`. The engine never
+queries system entropy; every pseudo-random draw is derived deterministically
+from ChaCha8 via an explicit seed. That compile-time guarantee eliminates
+invisible variance across machines and CI runners, and is what allows the
+entire engine to compile to `wasm32-unknown-unknown` for the browser timeline.
+
 ### The four pieces
+
+```
+           ┌───────────────────────┐
+           │   Agent Under Test    │
+           └───────────┬───────────┘
+                       │ Effects trait
+       ┌───────────────┼───────────────┬──────────────┐
+       ▼               ▼               ▼              ▼
+   Model Call      Tool Call         Clock           RNG
+  (Proxy/Shim)  (Side Effects)     (now_ms)      (next_f64)
+       │               │               │              │
+       └───────────────┼───────────────┴──────────────┘
+                       ▼
+           ┌───────────────────────┐
+           │     Canonicalizer     │  Redacts volatile fields
+           │      (canon.rs)       │  Deterministic key order
+           └───────────┬───────────┘
+                       ▼
+           ┌───────────────────────┐
+           │  Content-Addressable  │  BLAKE3-keyed CAS
+           │      Store (CAS)      │  Deduplicated payloads
+           └───────────┬───────────┘
+                       ▼
+           ┌───────────────────────┐
+           │     Replay Engine     │  • Strict: replay(record(r)) == r
+           │   & ResponseOracle    │  • Counterfactual: serve retries by identity
+           └───────────┬───────────┘
+                       ▼
+           ┌───────────────────────┐
+           │   Invariant Checker   │  Evaluates Landing (Yes/Maybe/No)
+           │    & Shadow Truth     │  using recorded shadows
+           └───────────┬───────────┘
+                       ▼
+           ┌───────────────────────┐
+           │   Delta Debugging     │  ddmin: reduces noisy schedules
+           │     (shrink.rs)       │  to 1-minimal culprits
+           └───────────┬───────────┘
+                       ▼
+           ┌───────────────────────┐
+           │      Certificate      │  Deterministic, timestamp-free
+           │   (Git Regression)    │  coverage verdict
+           └───────────────────────┘
+```
 
 | | |
 |---|---|
@@ -547,6 +609,22 @@ milliseconds ago. So it answers, the agent proceeds happily — and the file has
 now been deleted twice. That is the bug, reproduced offline, from a seed, with
 no API key.
 
+### Canonicalisation: why byte equality fails
+
+On replay, the engine must decide whether the effect the agent is asking for
+*now* is the same effect it asked for when recorded. Comparing raw JSON or
+request bytes fails immediately:
+- Provider SDKs stamp fresh request identifiers (`tool_call_id`, `request_id`).
+- Wall-clock timestamps leak into payloads (`created_at`, `timestamp`).
+- JSON object key orders vary across serialisers and language runtimes.
+
+Samsara runs requests through `Canonicalizer`: volatile paths (such as
+`messages.*.tool_call_id`, `request_id`, `timestamp`) are substituted with a
+fixed redaction marker, and object keys are lexicographically sorted before
+computing a BLAKE3 digest. The exact redaction path set is preserved in the
+trace header, ensuring replay and recording evaluate identity under identical
+rules.
+
 ### A timeout is not a failure
 
 It is an *absence of information*. The request may have been received,
@@ -556,6 +634,43 @@ same mistake would never catch it. Samsara resolves every call to **landed /
 maybe landed / did not land**, and because an injected fault records a *shadow*
 — the outcome it suppressed — a counterfactual can say the side effect happened
 twice with certainty rather than hedging.
+
+### How shrinking works (`ddmin`)
+
+Finding a failure with random fault injection is straightforward: search seeds
+until an invariant breaks. But a random schedule often contains four or five
+faults, several of which are irrelevant noise that happened not to alter the
+outcome. A bug report with five simultaneous faults is hard to understand and
+harder to fix.
+
+Samsara runs **delta debugging** (`ddmin`, Zeller & Hildebrandt 2002) over
+failing schedules:
+
+1. It partitions the fault schedule into subsets.
+2. It replays the agent against each subset to test whether the invariant still
+   breaks.
+3. It recursively narrows the schedule until it is **1-minimal**: every
+   remaining fault is load-bearing, and removing any single one makes the
+   failure disappear.
+
+This turns a multi-fault finding like:
+
+```text
+#1 delay(410ms), #2 error(503), #3 truncate(12B), #5 timeout
+```
+
+into:
+
+```text
+#2 error(503)
+```
+
+Delta debugging is only possible because Samsara’s replay is strictly
+deterministic. Against a live API, network latency and model jitter make test
+outcomes non-deterministic, corrupting the minimization predicate and causing
+delta debugging to discard the real culprit. Because Samsara replays offline
+against recorded effects, each shrink step takes milliseconds and the result is
+repeatable forever.
 
 ## Is replay actually faithful?
 
