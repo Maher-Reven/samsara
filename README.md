@@ -61,6 +61,7 @@ $ samsara demo          # no API key, no network, no cost
 **Using it:** [Who this is for](#who-this-is-for) ·
 [How it evaluates](#how-it-evaluates) ·
 [Providers](#which-providers) ·
+[Thresholds](#decisions-balanced-on-a-threshold) ·
 [Install](#install) ·
 [API docs](https://maher-reven.github.io/samsara/docs/) ·
 [Your first sweep](#your-first-sweep) ·
@@ -425,6 +426,48 @@ samsara sweep run.samsara.jsonl --pairs -- npm start
 
 Every schedule is a real launch of your agent against replayed responses. No
 tokens, no network — the expense is `fork`, not the model.
+
+### Decisions balanced on a threshold
+
+Models increasingly return typed answers with a confidence score rather than
+prose — [TypeSafe's Jev][jev] returns a typed value and a confidence, and it
+is not the last of its kind. That makes a particular agent easy to write:
+
+```ts
+const { answer, confidence } = await classify(doc);
+if (confidence > 0.8) await deleteDocument(doc.id);
+```
+
+Nothing there is wrong, and **no amount of breaking the transport will find
+the problem with it.** Every call succeeds, nothing times out, nothing
+retries. The recording came back at `0.86` and everyone moved on.
+
+Declare the threshold and Samsara probes it:
+
+```toml
+[[boundary]]
+field = "confidence"
+thresholds = [0.8]
+```
+
+```
+effect #0: an effectful call changes when `confidence` moves across 0.8
+           (recorded 0.86)
+  at 0.8:       (nothing)
+  at 0.8000001: tool:delete_file
+```
+
+A file is deleted or not on a difference of one part in a million — far finer
+than the model's own precision. Note which side is which: probing the
+threshold *exactly* is what separates `>` from `>=`, and that off-by-one is
+the entire bug in a good share of gates.
+
+Like order-dependence, this cannot be an invariant. No single run is wrong;
+the finding is that two runs which should agree do not. And the fix is not a
+better threshold — it is refusing to act alone inside a band where the score
+cannot support the decision.
+
+[jev]: https://typesafe.ai/blog/introducing-system-one-models-and-jev
 
 ### The certificate
 

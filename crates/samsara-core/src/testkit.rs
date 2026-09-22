@@ -97,8 +97,17 @@ impl FakeBackend {
                 "arguments": {"path": "/var/reports/stale.csv"}
             }),
             "plan_sections" => json!({"sections": ["intro", "summary", "appendix"]}),
+            // A typed verdict with a confidence score, as a System-1 style
+            // model returns. Recorded comfortably above the bar, which is
+            // exactly why nobody notices the decision is balanced on it.
+            "classify" => json!({"answer": "yes", "confidence": 0.86}),
             _ => json!({"text": "Done. Removed the stale report."}),
         };
+        // A typed model answers at the top level; a text model nests its
+        // reply under `content`. Both shapes go through the same recorder.
+        if step == "classify" {
+            return Outcome::ok(content);
+        }
         Outcome::ok(json!({
             "content": content,
             "usage": {"input_tokens": 120, "output_tokens": 40}
@@ -149,6 +158,7 @@ impl FakeBackend {
                 self.world.deletes.push(path.to_string());
                 Outcome::ok(json!({"ok": true, "path": path}))
             }
+            "escalate" => Outcome::ok(json!({"escalated": true})),
             "render_section" => {
                 let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                 Outcome::ok(json!({"name": name, "text": format!("<{name}>")}))
@@ -369,4 +379,88 @@ fn text_of(outcome: &Outcome) -> Option<String> {
         .and_then(|v| v.get("text"))
         .and_then(|v| v.as_str())
         .map(str::to_string)
+}
+
+// ---------------------------------------------------------------------------
+// An agent that gates on a score
+// ---------------------------------------------------------------------------
+
+/// How the classifying agent treats a confidence score.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gate {
+    /// Deletes whenever confidence clears the bar. The shape that typed,
+    /// score-returning models make easy to write and easy to get wrong: a
+    /// destructive action balanced on a threshold, with nothing between
+    /// "fairly sure" and "gone".
+    OnConfidence,
+    /// Deletes only when confidence clears the bar by a margin, and escalates
+    /// in the band between. Costs a human some attention and makes the
+    /// decision insensitive to a hair's-width difference.
+    WithMargin,
+}
+
+/// Threshold the agent believes it is using.
+pub const CONFIDENCE_BAR: f64 = 0.8;
+
+/// A band either side of the bar in which the careful agent refuses to act
+/// alone.
+pub const CONFIDENCE_MARGIN: f64 = 0.05;
+
+/// Ask a model whether a document is stale, then act on the answer.
+///
+/// The model returns a typed verdict and a confidence, which is what a
+/// System-1 style model returns rather than prose. What the agent does with
+/// that number is the thing under test.
+pub fn run_classifier<E: Effects>(fx: &mut E, gate: Gate) -> &'static str {
+    let verdict = fx.perform(EffectRequest::model(
+        "typed-classifier",
+        json!({"step": "classify", "question": "is this document stale?"}),
+    ));
+
+    let confidence = verdict
+        .value()
+        .and_then(|v| v.get("confidence"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let stale = verdict
+        .value()
+        .and_then(|v| v.pointer("/answer"))
+        .and_then(|v| v.as_str())
+        .map(|a| a == "yes")
+        .unwrap_or(false);
+
+    if !stale {
+        return "kept";
+    }
+
+    match gate {
+        Gate::OnConfidence => {
+            if confidence > CONFIDENCE_BAR {
+                fx.perform(EffectRequest::tool(
+                    "delete_file",
+                    json!({"path": "/var/reports/stale.csv"}),
+                ));
+                "deleted"
+            } else {
+                "kept"
+            }
+        }
+        Gate::WithMargin => {
+            if confidence > CONFIDENCE_BAR + CONFIDENCE_MARGIN {
+                fx.perform(EffectRequest::tool(
+                    "delete_file",
+                    json!({"path": "/var/reports/stale.csv"}),
+                ));
+                "deleted"
+            } else if confidence > CONFIDENCE_BAR - CONFIDENCE_MARGIN {
+                fx.perform(EffectRequest::tool(
+                    "escalate",
+                    json!({"reason": "confidence within margin of the bar"}),
+                ));
+                "escalated"
+            } else {
+                "kept"
+            }
+        }
+    }
 }

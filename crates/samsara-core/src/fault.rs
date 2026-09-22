@@ -20,7 +20,7 @@ use rand_chacha::ChaCha8Rng;
 use crate::event::{EffectKind, Outcome};
 
 /// A single perturbation applied to one effect's outcome.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Fault {
     /// The call never returns. The most productive fault by a wide margin:
@@ -41,6 +41,19 @@ pub enum Fault {
     /// The result is correct but arrives `ms` later, which can matter when
     /// the agent races it against a deadline.
     Delay { ms: u64 },
+    /// A numeric field in the response is moved to `value`.
+    ///
+    /// The first fault that is *semantic* rather than transport-level.
+    /// Everything else here breaks a call; this one lets it succeed and
+    /// changes what it said, by a hair.
+    ///
+    /// It exists because models started returning numbers. An agent that
+    /// gates a destructive action on `confidence > 0.8` has a failure
+    /// surface no timeout will ever find: what it does at `0.79`. You cannot
+    /// do boundary analysis on free text, which is why this becomes
+    /// interesting only now that typed answers with confidence scores are a
+    /// normal thing for a model to return.
+    Boundary { path: String, value: f64 },
     /// Concurrent calls complete in exactly this order.
     ///
     /// `Reorder` picks a permutation from a seed, which is what random
@@ -70,6 +83,7 @@ impl Fault {
             Fault::Delay { ms } => format!("delay({ms}ms)"),
             Fault::Reorder { .. } => "reorder".into(),
             Fault::Exact { order } => format!("order{order:?}"),
+            Fault::Boundary { path, value } => format!("{path}={value}"),
         }
     }
 
@@ -161,6 +175,19 @@ impl Fault {
             | Fault::Exact { .. }
             | Fault::Delay { .. }
             | Fault::Duplicate => observed.clone(),
+            Fault::Boundary { path, value } => match observed {
+                Outcome::Ok { value: body } => {
+                    let mut body = body.clone();
+                    // A path that does not resolve leaves the outcome alone.
+                    // The enumerator only aims these at responses that carry
+                    // the field, so a miss here means the agent asked
+                    // something different -- not an error, just nothing to
+                    // nudge.
+                    set_path(&mut body, path, Value::from(*value));
+                    Outcome::Ok { value: body }
+                }
+                other => other.clone(),
+            },
             Fault::Malformed => Outcome::Ok {
                 value: Value::String("{\"truncated\": tru".into()),
             },
@@ -190,6 +217,37 @@ impl Fault {
     }
 }
 
+/// Set a dotted path in a JSON document, if it already resolves.
+///
+/// Deliberately refuses to create missing keys. A boundary fault is meant to
+/// move a number the model actually returned; inventing a `confidence` field
+/// on a response that never had one would be testing a response shape that
+/// cannot occur.
+pub fn set_path(value: &mut Value, path: &str, new: Value) -> bool {
+    let Some((head, rest)) = path.split_once('.') else {
+        return match value.get_mut(path) {
+            Some(slot) => {
+                *slot = new;
+                true
+            }
+            None => false,
+        };
+    };
+    match value.get_mut(head) {
+        Some(child) => set_path(child, rest, new),
+        None => false,
+    }
+}
+
+/// Read a numeric dotted path, if present.
+pub fn read_path(value: &Value, path: &str) -> Option<f64> {
+    let mut current = value;
+    for segment in path.split('.') {
+        current = current.get(segment)?;
+    }
+    current.as_f64()
+}
+
 /// Largest index `<= i` that lies on a UTF-8 character boundary.
 fn floor_char_boundary(s: &str, i: usize) -> usize {
     let mut i = i.min(s.len());
@@ -200,7 +258,7 @@ fn floor_char_boundary(s: &str, i: usize) -> usize {
 }
 
 /// One fault, bound to the effect it perturbs.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FaultPoint {
     /// The `seq` of the event to perturb.
     pub seq: u64,
@@ -208,7 +266,7 @@ pub struct FaultPoint {
 }
 
 /// An ordered set of perturbations to apply to a replay.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FaultSchedule {
     pub points: Vec<FaultPoint>,
 }
@@ -372,6 +430,9 @@ mod tests {
                     // Never generated at random: exhaustive checking names
                     // the ordering it wants rather than drawing one.
                     Fault::Exact { .. } => "exact",
+                    // Aimed, never drawn: a boundary fault only means
+                    // something at a threshold someone declared.
+                    Fault::Boundary { .. } => "boundary",
                 });
             }
         }
@@ -385,6 +446,12 @@ mod tests {
             "reorder",
         ] {
             assert!(kinds.contains(kind), "generator never produced {kind}");
+        }
+        for aimed in ["exact", "boundary"] {
+            assert!(
+                !kinds.contains(aimed),
+                "`{aimed}` is aimed at a specific place and must not be drawn at random"
+            );
         }
         assert!(
             !kinds.contains("exact"),

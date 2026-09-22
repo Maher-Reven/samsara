@@ -115,4 +115,15 @@ effects = 200
 # [[invariant]]
 # type = "token_budget"
 # tokens = 100000
+
+# Numeric thresholds your agent branches on.
+#
+# If a model returns a score and you gate an action on it, say so here.
+# Samsara runs the agent just below, exactly on, and just above each
+# threshold, and tells you when a destructive call flips across a margin
+# finer than the model's own precision. Probing the exact value is what
+# separates `>` from `>=`.
+# [[boundary]]
+# field = "confidence"
+# thresholds = [0.8]
 "#;

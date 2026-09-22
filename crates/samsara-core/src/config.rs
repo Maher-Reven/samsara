@@ -131,6 +131,13 @@ pub struct Config {
     pub label: Option<String>,
     #[serde(default, rename = "invariant")]
     pub invariants: Vec<InvariantSpec>,
+    /// Numeric thresholds the agent branches on.
+    ///
+    /// Separate from invariants because a threshold is not a property that
+    /// can pass or fail on its own run — it is a place to look. The finding
+    /// is that two runs either side of it disagree.
+    #[serde(default, rename = "boundary")]
+    pub boundaries: Vec<crate::explore::BoundarySpec>,
 }
 
 impl Config {
@@ -144,6 +151,7 @@ impl Config {
         Config {
             label: None,
             invariants: vec![InvariantSpec::TerminatesWithin { effects: 512 }],
+            boundaries: Vec::new(),
         }
     }
 
@@ -157,7 +165,7 @@ impl Config {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.invariants.is_empty()
+        self.invariants.is_empty() && self.boundaries.is_empty()
     }
 }
 
@@ -198,6 +206,7 @@ mod tests {
     fn specs_roundtrip_through_json() {
         let config = Config {
             label: Some("checkout".into()),
+            boundaries: Vec::new(),
             invariants: vec![
                 InvariantSpec::NoDuplicateEffects {
                     tools: vec!["charge_card".into()],

@@ -11,6 +11,7 @@
 //! bug report someone closes.
 
 use crate::cas::Cas;
+use crate::event::Outcome;
 use crate::fault::{Fault, FaultPoint, FaultSchedule};
 use crate::invariant::{Invariant, Violation};
 use crate::replay::{Mode, Replayer};
@@ -755,4 +756,176 @@ fn heap(items: &mut Vec<usize>, k: usize, out: &mut Vec<Vec<usize>>) {
             items.swap(0, k - 1);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Decision boundaries
+// ---------------------------------------------------------------------------
+
+/// A threshold an agent's behaviour turns on.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BoundarySpec {
+    /// Dotted path to the number in a model response, e.g. `confidence`.
+    pub field: String,
+    /// The values the agent is believed to branch on.
+    pub thresholds: Vec<f64>,
+}
+
+/// A decision whose outcome turns on a hair's-width difference.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BoundarySensitivity {
+    /// Position of the response that was nudged.
+    pub at_seq: u64,
+    pub field: String,
+    pub threshold: f64,
+    /// What the recording actually returned there.
+    pub recorded: f64,
+    /// The two values whose behaviour differed.
+    pub below: f64,
+    pub above: f64,
+    /// First downstream effect that changed.
+    pub diverged_at: usize,
+    pub below_did: String,
+    pub above_did: String,
+    /// Whether anything that changed was a *world-changing* call. A routing
+    /// decision that flips is a design question; a delete that flips is an
+    /// incident waiting for a slow afternoon.
+    pub effectful: bool,
+}
+
+impl BoundarySensitivity {
+    pub fn report(&self) -> String {
+        let severity = if self.effectful {
+            "an effectful call changes"
+        } else {
+            "behaviour changes"
+        };
+        format!(
+            "effect #{}: {severity} when `{}` moves across {} (recorded {})\n  \
+             at {}: {}\n  at {}: {}",
+            self.at_seq,
+            self.field,
+            self.threshold,
+            self.recorded,
+            self.below,
+            self.below_did,
+            self.above,
+            self.above_did
+        )
+    }
+}
+
+/// How far either side of a threshold to probe.
+///
+/// Small enough that no reasonable agent means to distinguish the two values,
+/// which is the point: if behaviour differs across a gap this narrow, the
+/// decision is balanced on the threshold rather than informed by the score.
+const BOUNDARY_EPSILON: f64 = 1e-6;
+
+/// Look for decisions that turn on a threshold.
+///
+/// For every response carrying the declared field, the agent is run three
+/// times: just below the threshold, exactly on it, and just above. Comparing
+/// what it *did* afterwards shows whether a destructive action is gated on a
+/// margin far finer than the model's own precision.
+///
+/// Probing the threshold exactly is not padding — it is what separates `>`
+/// from `>=`, and that off-by-one is the whole bug in a meaningful number of
+/// gates.
+///
+/// Like order-dependence, this cannot be an
+/// [`Invariant`](crate::invariant::Invariant): no single run is wrong. The
+/// finding is that two runs which should agree do not.
+pub fn search_boundaries<C, F>(
+    trace: &Trace,
+    cas: &mut C,
+    specs: &[BoundarySpec],
+    mut drive: F,
+) -> Vec<BoundarySensitivity>
+where
+    C: Cas,
+    F: FnMut(&mut Replayer<'_, C>),
+{
+    if specs.is_empty() {
+        return Vec::new();
+    }
+
+    // Which responses actually carry each declared field. Nudging one that
+    // does not would test a response shape that cannot occur.
+    let mut targets: Vec<(u64, &BoundarySpec, f64)> = Vec::new();
+    for event in &trace.events {
+        let Ok(Some(bytes)) = cas.get(&event.outcome) else {
+            continue;
+        };
+        let Ok(Outcome::Ok { value }) = serde_json::from_slice::<Outcome>(&bytes) else {
+            continue;
+        };
+        for spec in specs {
+            if let Some(recorded) = crate::fault::read_path(&value, &spec.field) {
+                targets.push((event.seq, spec, recorded));
+            }
+        }
+    }
+
+    let run = |cas: &mut C, schedule: FaultSchedule, drive: &mut F| -> Vec<String> {
+        let mut replayer = Replayer::new(trace, cas, Mode::Counterfactual { schedule })
+            .expect("replayer construction reads only the store");
+        drive(&mut replayer);
+        behaviour(&replayer.finish("boundary-probe").branch)
+    };
+
+    let mut findings = Vec::new();
+    for (seq, spec, recorded) in targets {
+        for &threshold in &spec.thresholds {
+            let probes = [
+                threshold - BOUNDARY_EPSILON,
+                threshold,
+                threshold + BOUNDARY_EPSILON,
+            ];
+            let behaviours: Vec<Vec<String>> = probes
+                .iter()
+                .map(|&value| {
+                    let schedule = FaultSchedule::of(vec![FaultPoint {
+                        seq,
+                        fault: Fault::Boundary {
+                            path: spec.field.clone(),
+                            value,
+                        },
+                    }]);
+                    run(cas, schedule, &mut drive)
+                })
+                .collect();
+
+            // Compare each adjacent pair, so `>` versus `>=` shows up as a
+            // difference between "exactly on" and one of its neighbours.
+            for (i, j) in [(0usize, 1usize), (1, 2)] {
+                let Some(at) = first_difference_at(&behaviours[i], &behaviours[j]) else {
+                    continue;
+                };
+                let below_did = behaviours[i]
+                    .get(at)
+                    .cloned()
+                    .unwrap_or_else(|| "(nothing)".into());
+                let above_did = behaviours[j]
+                    .get(at)
+                    .cloned()
+                    .unwrap_or_else(|| "(nothing)".into());
+
+                findings.push(BoundarySensitivity {
+                    at_seq: seq,
+                    field: spec.field.clone(),
+                    threshold,
+                    recorded,
+                    below: probes[i],
+                    above: probes[j],
+                    diverged_at: at,
+                    effectful: below_did.starts_with("tool:") || above_did.starts_with("tool:"),
+                    below_did,
+                    above_did,
+                });
+                break;
+            }
+        }
+    }
+    findings
 }

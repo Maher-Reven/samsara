@@ -60,7 +60,8 @@ pub mod prelude {
     pub use crate::event::{EffectKind, EffectRequest, Event, Outcome};
     pub use crate::explore::{
         batches, behaviour, evaluate, interleavings, minimise, permutations, plan, search,
-        search_order_dependence, sweep, Case, Coverage, Finding, Interleavings, OrderDependence,
+        search_boundaries, search_order_dependence, sweep, BoundarySensitivity, BoundarySpec, Case,
+        Coverage, Finding, Interleavings, OrderDependence,
     };
     pub use crate::fault::{Fault, FaultPoint, FaultSchedule};
     pub use crate::hash::Digest;
