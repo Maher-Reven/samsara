@@ -15,7 +15,9 @@
 
 use std::path::{Path, PathBuf};
 
-use samsara_core::explore::{batches, behaviour, permutations, plan, EXHAUSTIVE_WIDTH};
+use samsara_core::explore::{
+    batches, behaviour, permutations, plan, BoundarySensitivity, BoundarySpec, EXHAUSTIVE_WIDTH,
+};
 use samsara_core::prelude::*;
 use samsara_core::testkit::{run_agent, run_assembler, Assembly, FakeBackend, Style};
 
@@ -90,7 +92,7 @@ pub fn run_external(options: External<'_>) -> Result<(), Box<dyn std::error::Err
         return Err("nothing to run: pass the agent command after `--`".into());
     }
 
-    let harness = crate::replay_cmd::Harness::start(trace_path, port)?;
+    let harness = crate::replay_cmd::Harness::start(trace_path, port)?.quiet();
     let trace = harness.trace();
     let plan = plan(trace, pairs);
     let invariants = config.build();
@@ -152,6 +154,9 @@ pub fn run_external(options: External<'_>) -> Result<(), Box<dyn std::error::Err
 
     // Orderings, for any batch the recording captured.
     let orders = external_interleavings(&harness, command, &mut budget)?;
+
+    // Thresholds the agent was declared to branch on.
+    let thresholds = external_boundaries(&harness, command, &config.boundaries, &mut budget)?;
     harness.shutdown();
 
     let certificate = Certificate::new(
@@ -160,6 +165,7 @@ pub fn run_external(options: External<'_>) -> Result<(), Box<dyn std::error::Err
         config.names(),
         coverage,
         orders,
+        thresholds,
     );
     finish(certificate, out, check)
 }
@@ -264,6 +270,109 @@ fn external_interleavings(
     Ok(reports)
 }
 
+/// Probe every declared threshold against a real agent.
+///
+/// Three launches per threshold -- just below, exactly on, just above --
+/// because the exact value is what separates `>` from `>=`.
+fn external_boundaries(
+    harness: &crate::replay_cmd::Harness,
+    command: &[String],
+    specs: &[BoundarySpec],
+    budget: &mut usize,
+) -> Result<Vec<BoundarySensitivity>, Box<dyn std::error::Error>> {
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let trace = harness.trace();
+    let cas = FsCas::open(harness.objects())?;
+
+    // Which responses carry each declared field, and what they returned.
+    let mut targets: Vec<(u64, &BoundarySpec, f64)> = Vec::new();
+    for event in &trace.events {
+        let Ok(Some(bytes)) = cas.get(&event.outcome) else {
+            continue;
+        };
+        let Ok(Outcome::Ok { value }) = serde_json::from_slice::<Outcome>(&bytes) else {
+            continue;
+        };
+        for spec in specs {
+            if let Some(recorded) = samsara_core::fault::read_path(&value, &spec.field) {
+                targets.push((event.seq, spec, recorded));
+            }
+        }
+    }
+    if targets.is_empty() {
+        ui::info("no response carried a declared threshold field");
+        return Ok(Vec::new());
+    }
+
+    let run =
+        |value: f64, seq: u64, field: &str| -> Result<Vec<String>, Box<dyn std::error::Error>> {
+            let schedule = FaultSchedule::of(vec![FaultPoint {
+                seq,
+                fault: Fault::Boundary {
+                    path: field.to_string(),
+                    value,
+                },
+            }]);
+            let (result, _) = harness.run_once(Mode::Counterfactual { schedule }, command)?;
+            Ok(behaviour(&result.branch))
+        };
+
+    let mut findings = Vec::new();
+    for (seq, spec, recorded) in targets {
+        for &threshold in &spec.thresholds {
+            if *budget < 3 {
+                break;
+            }
+            *budget -= 3;
+            let probes = [threshold - EPSILON, threshold, threshold + EPSILON];
+            let mut seen = Vec::new();
+            for value in probes {
+                seen.push(run(value, seq, &spec.field)?);
+            }
+
+            for (i, j) in [(0usize, 1usize), (1, 2)] {
+                let Some(at) = seen[i]
+                    .iter()
+                    .zip(seen[j].iter())
+                    .position(|(a, b)| a != b)
+                    .or_else(|| {
+                        (seen[i].len() != seen[j].len()).then_some(seen[i].len().min(seen[j].len()))
+                    })
+                else {
+                    continue;
+                };
+                let below_did = seen[i]
+                    .get(at)
+                    .cloned()
+                    .unwrap_or_else(|| "(nothing)".into());
+                let above_did = seen[j]
+                    .get(at)
+                    .cloned()
+                    .unwrap_or_else(|| "(nothing)".into());
+                findings.push(BoundarySensitivity {
+                    at_seq: seq,
+                    field: spec.field.clone(),
+                    threshold,
+                    recorded,
+                    below: probes[i],
+                    above: probes[j],
+                    diverged_at: at,
+                    effectful: below_did.starts_with("tool:") || above_did.starts_with("tool:"),
+                    below_did,
+                    above_did,
+                });
+                break;
+            }
+        }
+    }
+    Ok(findings)
+}
+
+/// How far either side of a threshold to probe. Matches the engine's own.
+const EPSILON: f64 = 1e-6;
+
 /// A one-line rendering of the agent command.
 ///
 /// Agents are often launched through a shell with an inline script, so the
@@ -333,6 +442,7 @@ fn sweep_retry(style: Style, pairs: bool, max_replays: usize) -> Certificate {
         invariant_names(),
         coverage,
         orders,
+        Vec::new(),
     )
 }
 
@@ -355,6 +465,7 @@ fn sweep_order(assembly: Assembly, pairs: bool, max_replays: usize) -> Certifica
         invariant_names(),
         coverage,
         orders,
+        Vec::new(),
     )
 }
 
@@ -428,6 +539,17 @@ fn report(certificate: &Certificate) {
             ui::bad(&order.claim());
         }
     }
+    for boundary in &certificate.boundaries {
+        let line = format!(
+            "`{}` at {} changes what the agent does",
+            boundary.field, boundary.threshold
+        );
+        if boundary.effectful {
+            ui::bad(&line);
+        } else {
+            ui::info(&line);
+        }
+    }
 
     if !c.failures.is_empty() {
         ui::heading(3, "Failing schedules");
@@ -442,9 +564,22 @@ fn report(certificate: &Certificate) {
         }
     }
 
+    if !certificate.boundaries.is_empty() {
+        ui::heading(4, "Thresholds");
+        for boundary in &certificate.boundaries {
+            for line in boundary.report().lines() {
+                if boundary.effectful && !line.starts_with("  ") {
+                    ui::bad(line);
+                } else {
+                    println!("     {}", ui::dim(line));
+                }
+            }
+        }
+    }
+
     for order in &certificate.interleavings {
         if !order.is_order_independent() {
-            ui::heading(4, "Ordering");
+            ui::heading(5, "Ordering");
             ui::bad(&format!(
                 "{} of {} orderings change what the agent does",
                 order.divergent.len(),

@@ -44,6 +44,9 @@ pub struct Certificate {
     pub invariants: Vec<String>,
     pub coverage: Coverage,
     pub interleavings: Vec<Interleavings>,
+    /// Decisions found to turn on a declared threshold.
+    #[serde(default)]
+    pub boundaries: Vec<crate::explore::BoundarySensitivity>,
     pub verdict: Verdict,
     /// The claims, in plain English, as the tool would state them.
     pub claims: Vec<String>,
@@ -58,12 +61,23 @@ impl Certificate {
         invariants: Vec<String>,
         coverage: Coverage,
         interleavings: Vec<Interleavings>,
+        boundaries: Vec<crate::explore::BoundarySensitivity>,
     ) -> Self {
-        let broken =
-            !coverage.is_clean() || interleavings.iter().any(|i| !i.is_order_independent());
+        // A threshold that only moves a routing decision is worth reporting
+        // and not worth failing a build over. One that moves a destructive
+        // call is a different matter.
+        let dangerous = boundaries.iter().filter(|b| b.effectful).count();
+        let broken = !coverage.is_clean()
+            || interleavings.iter().any(|i| !i.is_order_independent())
+            || dangerous > 0;
 
         let mut claims = vec![coverage.claim()];
         claims.extend(interleavings.iter().map(Interleavings::claim));
+        if dangerous > 0 {
+            claims.push(format!(
+                "{dangerous} effectful decision(s) flip across a declared threshold"
+            ));
+        }
 
         Certificate {
             version: CERTIFICATE_VERSION,
@@ -73,6 +87,7 @@ impl Certificate {
             invariants,
             coverage,
             interleavings,
+            boundaries,
             verdict: if broken {
                 Verdict::Broken
             } else {
@@ -145,6 +160,14 @@ impl Certificate {
             ));
         }
 
+        if previous.boundaries.len() != self.boundaries.len() {
+            out.push(format!(
+                "threshold-sensitive decisions {} \u{2192} {}",
+                previous.boundaries.len(),
+                self.boundaries.len()
+            ));
+        }
+
         for (before, after) in previous.interleavings.iter().zip(&self.interleavings) {
             if before.divergent.len() != after.divergent.len() {
                 out.push(format!(
@@ -203,6 +226,7 @@ mod tests {
             "run".into(),
             vec!["no_duplicate_effects".into()],
             coverage(singles, failures),
+            vec![],
             vec![],
         )
     }

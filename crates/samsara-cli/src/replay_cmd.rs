@@ -123,6 +123,13 @@ pub struct Harness {
     trace: &'static Trace,
     stop: Arc<AtomicU64>,
     serving: Option<std::thread::JoinHandle<()>>,
+    /// Silence the agent's own output.
+    ///
+    /// A sweep launches the agent hundreds of times, and an agent that logs
+    /// anything at all will bury the progress line under its own chatter. A
+    /// single replay keeps it: there you are watching one run, and what it
+    /// printed is usually the point.
+    quiet: bool,
 }
 
 impl Harness {
@@ -163,11 +170,23 @@ impl Harness {
             trace,
             stop,
             serving: Some(serving),
+            quiet: false,
         })
+    }
+
+    /// Suppress the agent's stdout and stderr.
+    pub fn quiet(mut self) -> Self {
+        self.quiet = true;
+        self
     }
 
     pub fn trace(&self) -> &'static Trace {
         self.trace
+    }
+
+    /// The object store beside the trace this harness is replaying.
+    pub fn objects(&self) -> &std::path::Path {
+        &self.objects
     }
 
     /// Run the agent once under `mode`.
@@ -192,7 +211,13 @@ impl Harness {
             session.next_call = 0;
         }
 
-        let status = std::process::Command::new(&command[0])
+        let mut child = std::process::Command::new(&command[0]);
+        if self.quiet {
+            child
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+        }
+        let status = child
             .args(&command[1..])
             .env("ANTHROPIC_BASE_URL", &self.base)
             .env("OPENAI_BASE_URL", format!("{}/v1", self.base))
