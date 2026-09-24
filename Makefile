@@ -1,7 +1,7 @@
 CARGO ?= cargo
 WASM_OUT := web/pkg
 
-.PHONY: all test lint demo web web-test shim clean
+.PHONY: all test lint demo example example-paced demo-svg web web-test shim clean
 
 all: test lint
 
@@ -14,6 +14,24 @@ lint:
 
 demo:
 	$(CARGO) run --bin samsara -- demo
+
+## The worked example, end to end, from nothing. Builds what it needs.
+example: | .example-deps
+	cd examples/document-cleanup && ./demo.sh
+
+## The same walkthrough, pausing between beats, for presenting live.
+example-paced: | .example-deps
+	cd examples/document-cleanup && ./demo.sh --paced
+
+.example-deps:
+	$(CARGO) build --release
+	cd shim/typescript && npm install --silent && npm run build --silent
+	cd examples/document-cleanup && npm install --silent
+
+## Regenerate the README's terminal image from a live run, so it cannot
+## drift away from what the tool actually prints.
+demo-svg: | .example-deps
+	cd examples/document-cleanup && ./svg.sh
 
 ## Build the WebAssembly engine and bindings for the browser timeline.
 web:

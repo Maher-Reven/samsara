@@ -12,7 +12,18 @@ PROVIDER=$!
 trap 'kill $PROVIDER 2>/dev/null || true' EXIT
 sleep 1
 
-say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+PACED=0
+[ "${1:-}" = "--paced" ] && PACED=1
+
+say() {
+  printf '\n\033[1m%s\033[0m\n' "$*"
+  # Presenting live: stop between beats so there is room to talk. The
+  # narration for each is in README.md.
+  if [ "$PACED" = "1" ]; then
+    printf '\033[2m   [enter]\033[0m'
+    read -r _ </dev/tty || true
+  fi
+}
 
 say "1. The agent works"
 rm -f ledger.log

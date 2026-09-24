@@ -10,6 +10,12 @@ Your agent failed once. Make it fail on demand.
 real engine compiled to WebAssembly. Click any effect to fault it and watch
 the two timelines diverge. No install, no API key, nothing sent anywhere.
 
+<img src="assets/sweep.svg" alt="samsara sweep finding a duplicate delete and a threshold-sensitive decision in a real agent" width="100%">
+
+<sub>A real agent, swept exhaustively. Generated from a live run by
+<code>make demo-svg</code>, so it cannot drift from what the tool prints.
+Run it yourself with <code>make example</code>.</sub>
+
 ---
 
 A tool call times out. The agent retries. But the first call *succeeded* — the
@@ -508,7 +514,8 @@ audits and notifies. It works. Every test you would write against its happy
 path passes.
 
 ```bash
-cd examples/document-cleanup && npm install && ./demo.sh
+make example            # builds what it needs, then runs the whole walkthrough
+make example-paced      # the same, pausing between beats, for presenting live
 ```
 
 Samsara finds two bugs in it and verifies a third property is sound:

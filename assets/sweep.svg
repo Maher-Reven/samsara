@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1463" height="566" viewBox="0 0 1463 566" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13">
+<rect width="1463" height="566" rx="10" fill="#16151a"/>
+<circle cx="22" cy="19" r="6" fill="#e06c75"/>
+<circle cx="42" cy="19" r="6" fill="#e5c07b"/>
+<circle cx="62" cy="19" r="6" fill="#98c379"/>
+<text x="731" y="24" fill="#7d7a8c" text-anchor="middle" font-size="12">samsara</text>
+<text x="26.0" y="80" fill="#d7d5e0" xml:space="preserve">node agent.mjs  1809803631db</text>
+<text x="26.0" y="120" fill="#d7d5e0" xml:space="preserve">1. What was checked</text>
+<text x="26.0" y="140" fill="#d7d5e0" xml:space="preserve">  • 7 faultable positions × 5 fault kinds</text>
+<text x="26.0" y="160" fill="#d7d5e0" xml:space="preserve">  • 35 single-fault schedules (all of them)</text>
+<text x="26.0" y="180" fill="#d7d5e0" xml:space="preserve">  • batch #1: 6 of 6 orderings (all of them)</text>
+<text x="26.0" y="200" fill="#d7d5e0" xml:space="preserve">  • 42 replays total (35 fault, 7 ordering)</text>
+<text x="26.0" y="240" fill="#d7d5e0" xml:space="preserve">2. What it means</text>
+<text x="26.0" y="260" fill="#d7d5e0" xml:space="preserve">  ✗ 2 of 35 single faults break it</text>
+<text x="26.0" y="280" fill="#d7d5e0" xml:space="preserve">  ✓ batch #1 is order-independent across all 6 orderings</text>
+<text x="26.0" y="300" fill="#d7d5e0" xml:space="preserve">  ✗ `confidence` at 0.8 changes what the agent does</text>
+<text x="26.0" y="340" fill="#d7d5e0" xml:space="preserve">3. Failing schedules</text>
+<text x="26.0" y="360" fill="#d7d5e0" xml:space="preserve">     #4 timeout</text>
+<text x="26.0" y="380" fill="#d7d5e0" xml:space="preserve">       [no_duplicate_effects] at effect #7: `delete_document` took effect at #4 and again at #7 with identical arguments (28c64180cc24) — the side effect happened twice</text>
+<text x="26.0" y="400" fill="#d7d5e0" xml:space="preserve">     #4 error(503)</text>
+<text x="26.0" y="420" fill="#d7d5e0" xml:space="preserve">       [no_duplicate_effects] at effect #7: `delete_document` took effect at #4 and again at #7 with identical arguments (28c64180cc24) — the side effect happened twice</text>
+<text x="26.0" y="460" fill="#d7d5e0" xml:space="preserve">4. Thresholds</text>
+<text x="26.0" y="480" fill="#d7d5e0" xml:space="preserve">  ✗ effect #0: an effectful call changes when `confidence` moves across 0.8 (recorded 0.86)</text>
+<text x="26.0" y="500" fill="#d7d5e0" xml:space="preserve">       at 0.8: (nothing)</text>
+<text x="26.0" y="520" fill="#d7d5e0" xml:space="preserve">       at 0.8000010000000001: tool:delete_document:28c64180cc24</text>
+</svg>

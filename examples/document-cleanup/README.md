@@ -24,6 +24,18 @@ you write against that path passes.
 
 ## Setup
 
+From the repo root, one command builds everything and runs the whole thing:
+
+```bash
+make example            # runs it straight through
+make example-paced      # pauses between beats, for presenting live
+```
+
+`--paced` waits for Enter before each beat, so there is room to talk. The
+narration is below.
+
+To drive it by hand instead:
+
 ```bash
 cargo build --release                  # from the repo root
 cd shim/typescript && npm install && npm run build && cd -
