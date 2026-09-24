@@ -1,0 +1,35 @@
+# What must never happen to a student's documents.
+
+label = "document-cleanup"
+
+# Deleting twice is the incident. Metadata lookups are reads, so they are
+# deliberately not on this list -- watching them would produce noise and
+# train you to ignore the result.
+[[invariant]]
+type = "no_duplicate_effects"
+tools = ["delete_document", "notify_owner"]
+# A key stable across retries means the tool is obliged to deduplicate, so
+# retrying is correct and must not be flagged.
+idempotency_key = "idempotency_key"
+
+# Nothing is deleted without a record of it.
+[[invariant]]
+type = "requires"
+tool = "delete_document"
+then = "log_audit"
+
+# Do not tell the owner their document is gone if the delete failed.
+[[invariant]]
+type = "never_after_failure"
+tool = "notify_owner"
+after = "delete_document"
+
+# The run finishes.
+[[invariant]]
+type = "terminates_within"
+effects = 40
+
+# The agent deletes when the model is more than 80% sure. Is it?
+[[boundary]]
+field = "confidence"
+thresholds = [0.8]

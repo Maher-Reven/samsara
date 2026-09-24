@@ -1,0 +1,8 @@
+{
+  "name": "samsara-example-document-cleanup",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@samsara/shim": "file:../../shim/typescript"
+  }
+}

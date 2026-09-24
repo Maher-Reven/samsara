@@ -59,6 +59,7 @@ $ samsara demo          # no API key, no network, no cost
 <!-- toc -->
 
 **Using it:** [Who this is for](#who-this-is-for) ·
+[Worked example](#a-worked-example-you-can-run) ·
 [How it evaluates](#how-it-evaluates) ·
 [Providers](#which-providers) ·
 [Thresholds](#decisions-balanced-on-a-threshold) ·
@@ -498,6 +499,28 @@ verdict stays green:
 
 A gate that only compared pass/fail would wave that through.
 `certificates/` holds this repo's own, and CI re-checks them.
+
+## A worked example you can run
+
+[`examples/document-cleanup`](examples/document-cleanup) is a real agent — a
+document cleanup bot that classifies, fetches metadata concurrently, deletes,
+audits and notifies. It works. Every test you would write against its happy
+path passes.
+
+```bash
+cd examples/document-cleanup && npm install && ./demo.sh
+```
+
+Samsara finds two bugs in it and verifies a third property is sound:
+
+```
+✗ 2 of 35 single faults break it          → a timeout makes it delete twice
+✓ batch #1 is order-independent            → the concurrency is genuinely fine
+✗ `confidence` at 0.8 changes what it does → a delete rides on one part in a million
+```
+
+Its [README](examples/document-cleanup/README.md) is a six-beat walkthrough
+with the narration, if you are showing it to someone.
 
 ## Try it
 
