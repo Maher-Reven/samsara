@@ -120,10 +120,28 @@ impl Canonicalizer {
     /// there means serving one effect's recorded response to a completely
     /// different effect — silently, and with no divergence reported.
     pub fn effect_identity(&self, kind: &str, name: &str, body: &Value) -> Digest {
+        // Volatile paths apply to model requests only.
+        //
+        // The defaults redact things like `id` because a provider stamps a
+        // fresh one on every attempt. A *tool* argument named `id` is the
+        // opposite: it is the entire meaning of the call. Redacting it
+        // collapses `delete_document(id: "a")` and `delete_document(id: "b")`
+        // into one identity, which makes the oracle serve the wrong answer
+        // and makes the duplicate-effect check report two different deletions
+        // as one repeated.
+        //
+        // Tool arguments are therefore compared exactly, with only key
+        // ordering normalised. If a tool really does take a volatile
+        // argument, declare it — an explicit path still applies here.
+        let canonical = if kind == "model" {
+            self.canonicalize(body)
+        } else {
+            body.clone()
+        };
         let envelope = serde_json::json!({
             "kind": kind,
             "name": name,
-            "body": self.canonicalize(body),
+            "body": canonical,
         });
         Digest::of(&serde_json::to_vec(&envelope).expect("Value always serialises"))
     }
@@ -241,6 +259,37 @@ mod tests {
         assert_eq!(
             c.effect_identity("tool", "delete_file", &body),
             c.effect_identity("tool", "delete_file", &json!({"path": "/x"}))
+        );
+    }
+
+    #[test]
+    fn a_tool_argument_named_id_is_not_treated_as_volatile() {
+        // The defaults redact `id` because providers stamp one on every
+        // request. For a tool it is the whole meaning of the call, and
+        // collapsing two of them would report deleting two different
+        // documents as deleting one twice.
+        let c = Canonicalizer::default();
+        assert_ne!(
+            c.effect_identity("tool", "delete_document", &json!({"id": "a"})),
+            c.effect_identity("tool", "delete_document", &json!({"id": "b"})),
+        );
+        // Same call, same identity, regardless of key order.
+        assert_eq!(
+            c.effect_identity(
+                "tool",
+                "delete_document",
+                &json!({"id": "a", "force": true})
+            ),
+            c.effect_identity(
+                "tool",
+                "delete_document",
+                &json!({"force": true, "id": "a"})
+            ),
+        );
+        // A model request still has its volatile fields ignored.
+        assert_eq!(
+            c.effect_identity("model", "m", &json!({"id": "req_1", "prompt": "x"})),
+            c.effect_identity("model", "m", &json!({"id": "req_2", "prompt": "x"})),
         );
     }
 

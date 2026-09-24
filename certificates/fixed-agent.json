@@ -18,6 +18,7 @@
     "failures": []
   },
   "interleavings": [],
+  "boundaries": [],
   "verdict": "clean",
   "claims": [
     "no single fault breaks this agent — all 15 were checked; no pair does either, across all 75"
